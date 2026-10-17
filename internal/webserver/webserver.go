@@ -1,0 +1,147 @@
+// Package webserver defines the adapter contract implemented by every
+// supported web server (Nginx, Apache) and the server-neutral data model.
+package webserver
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+)
+
+// Kind identifies a web server implementation.
+type Kind string
+
+const (
+	KindNginx  Kind = "nginx"
+	KindApache Kind = "apache"
+)
+
+// Listen is a single listening address of a virtual host.
+type Listen struct {
+	Addr string `json:"addr,omitempty"`
+	Port int    `json:"port"`
+	TLS  bool   `json:"tls"`
+}
+
+// VirtualHost is a server-neutral view of an Nginx server block or an Apache
+// <VirtualHost> section.
+type VirtualHost struct {
+	Server           Kind     `json:"server"`
+	File             string   `json:"file"`
+	Line             int      `json:"line"`
+	Enabled          bool     `json:"enabled"`
+	Listen           []Listen `json:"listen"`
+	Names            []string `json:"names"`
+	CertFile         string   `json:"cert_file,omitempty"`
+	KeyFile          string   `json:"key_file,omitempty"`
+	ChainFile        string   `json:"chain_file,omitempty"`
+	Webroot          string   `json:"webroot,omitempty"`
+	RedirectsToHTTPS bool     `json:"redirects_to_https"`
+	ManagedBy        string   `json:"managed_by,omitempty"`
+}
+
+// TLS reports whether any listener of the host terminates TLS.
+func (v VirtualHost) TLS() bool {
+	for _, l := range v.Listen {
+		if l.TLS {
+			return true
+		}
+	}
+	return false
+}
+
+// Ports returns a compact description such as "80,443s".
+func (v VirtualHost) Ports() string {
+	seen := map[string]bool{}
+	var out []string
+	for _, l := range v.Listen {
+		p := strconv.Itoa(l.Port)
+		if l.TLS {
+			p += "s"
+		}
+		if !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	return strings.Join(out, ",")
+}
+
+// Location returns "file:line".
+func (v VirtualHost) Location() string {
+	return v.File + ":" + strconv.Itoa(v.Line)
+}
+
+// Installation describes a detected web server.
+type Installation struct {
+	Kind       Kind   `json:"kind"`
+	Found      bool   `json:"found"`
+	Binary     string `json:"binary,omitempty"`
+	Version    string `json:"version,omitempty"`
+	ConfigPath string `json:"config_path,omitempty"`
+}
+
+// Result is the outcome of configuration discovery.
+type Result struct {
+	Hosts    []VirtualHost
+	Files    []string
+	Warnings []string
+}
+
+// Adapter is implemented by every supported web server.
+type Adapter interface {
+	Kind() Kind
+	Detect(ctx context.Context) Installation
+	Discover(ctx context.Context, inst Installation) (*Result, error)
+	Validate(ctx context.Context, inst Installation) (string, error)
+}
+
+// FirstExisting returns the first path that exists, or "".
+func FirstExisting(paths []string) string {
+	for _, p := range paths {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+// RealPath resolves symlinks, falling back to the cleaned absolute path.
+func RealPath(p string) string {
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		p = r
+	}
+	if a, err := filepath.Abs(p); err == nil {
+		return a
+	}
+	return filepath.Clean(p)
+}
+
+// SplitAddrPort parses "addr:port", "[::]:443", "443" or "addr".
+func SplitAddrPort(s string, defPort int) (string, int) {
+	if p, err := strconv.Atoi(s); err == nil {
+		return "", p
+	}
+	if i := strings.LastIndex(s, ":"); i >= 0 && !strings.HasSuffix(s, "]") {
+		if p, err := strconv.Atoi(s[i+1:]); err == nil {
+			return s[:i], p
+		}
+	}
+	return s, defPort
+}
+
+// ManagedBy guesses which client manages a certificate path.
+func ManagedBy(certPath string) string {
+	switch {
+	case certPath == "":
+		return ""
+	case strings.Contains(certPath, "/etc/letsencrypt/"):
+		return "certbot"
+	case strings.Contains(certPath, "/var/lib/certx/"):
+		return "certx"
+	default:
+		return "manual"
+	}
+}
