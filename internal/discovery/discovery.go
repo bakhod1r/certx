@@ -66,6 +66,21 @@ type Inventory struct {
 	Servers   []webserver.Installation `json:"servers"`
 	Hosts     []Host                   `json:"hosts"`
 	Warnings  []string                 `json:"warnings,omitempty"`
+
+	adapters map[webserver.Kind]webserver.Adapter
+}
+
+// Adapter returns the adapter that produced hosts of kind k.
+func (inv *Inventory) Adapter(k webserver.Kind) webserver.Adapter { return inv.adapters[k] }
+
+// Installation returns the detected installation of kind k.
+func (inv *Inventory) Installation(k webserver.Kind) webserver.Installation {
+	for _, s := range inv.Servers {
+		if s.Kind == k {
+			return s
+		}
+	}
+	return webserver.Installation{Kind: k}
 }
 
 // Adapters returns the adapters selected by opts.
@@ -97,9 +112,10 @@ func Scan(ctx context.Context, opts Options) (*Inventory, error) {
 	if opts.WarnDays <= 0 {
 		opts.WarnDays = 30
 	}
-	inv := &Inventory{ScannedAt: now}
+	inv := &Inventory{ScannedAt: now, adapters: map[webserver.Kind]webserver.Adapter{}}
 	for _, a := range Adapters(opts) {
 		inst := a.Detect(ctx)
+		inv.adapters[a.Kind()] = a
 		inv.Servers = append(inv.Servers, inst)
 		if !inst.Found {
 			continue
@@ -124,25 +140,35 @@ func Scan(ctx context.Context, opts Options) (*Inventory, error) {
 }
 
 // Validate runs the configuration test of every detected server.
-func Validate(ctx context.Context, opts Options, inv *Inventory) string {
+func Validate(ctx context.Context, inv *Inventory) string {
 	var b strings.Builder
-	for _, a := range Adapters(opts) {
-		for _, inst := range inv.Servers {
-			if inst.Kind != a.Kind() || !inst.Found {
-				continue
-			}
-			out, err := a.Validate(ctx, inst)
-			state := "OK"
-			if err != nil {
-				state = "FAILED: " + err.Error()
-			}
-			fmt.Fprintf(&b, "== %s (%s) — %s\n%s\n\n", inst.Kind, orDash(inst.Binary), state, out)
+	for _, inst := range inv.Servers {
+		a := inv.Adapter(inst.Kind)
+		if a == nil || !inst.Found {
+			continue
 		}
+		out, err := a.Validate(ctx, inst)
+		state := "OK"
+		if err != nil {
+			state = "FAILED: " + err.Error()
+		}
+		fmt.Fprintf(&b, "== %s (%s) — %s\n%s\n\n", inst.Kind, orDash(inst.Binary), state, out)
 	}
 	if b.Len() == 0 {
 		return "No web server installation detected."
 	}
 	return strings.TrimSpace(b.String())
+}
+
+// PublicNames returns the normalised names of h that can be certified.
+func PublicNames(h Host) []string {
+	var out []string
+	for _, n := range h.Names {
+		if c := checkable(n); c != "" {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // ProbeName returns the first public-looking name of a host, if any.

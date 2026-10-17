@@ -19,7 +19,7 @@ func (m model) View() string {
 	switch m.view {
 	case viewDetail:
 		h := m.inv.Hosts[m.detailIdx]
-		return m.pager(firstName(h), "esc back · ↑/↓ scroll · n/p next/prev · t live TLS check")
+		return m.pager(firstName(h), "esc back · ↑/↓ scroll · n/N next/prev · t live TLS check · d deploy plan")
 	case viewText:
 		return m.pager(m.textTitle, "esc back · ↑/↓ scroll")
 	}

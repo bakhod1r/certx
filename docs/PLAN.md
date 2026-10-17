@@ -140,6 +140,7 @@ domains:
 
 | Bosqich | Natija |
 |---|---|
+| ✅ P0.1–P0.5 | Bajarildi: scan, status/TUI, plan, issue (HTTP-01), deploy, rollback, validate |
 | P0.1 | Adapter interfeysi, `execx`, `config`, Nginx adapteri, `scan` |
 | P0.2 | Apache adapteri (Debian/RHEL), parser + `-S` cross-check |
 | P0.3 | `status`, `inspect` (local va remote) |

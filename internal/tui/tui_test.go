@@ -43,7 +43,7 @@ func TestModelFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var m tea.Model = newModel(opts)
+	var m tea.Model = newModel(Options{Scan: opts, Storage: "/var/lib/certx"})
 	m, _ = m.Update(tea.WindowSizeMsg{Width: 140, Height: 30})
 	if !strings.Contains(m.View(), "Scanning") {
 		t.Fatal("expected loading screen")
@@ -71,6 +71,10 @@ func TestModelFlow(t *testing.T) {
 	m = press(m, "enter")
 	if out = m.View(); !strings.Contains(out, "/var/www/shop") || !strings.Contains(out, "Live TLS endpoint") {
 		t.Errorf("detail view:\n%s", out)
+	}
+	m = press(m, "d")
+	if out = m.View(); !strings.Contains(out, "+    listen 443 ssl; # managed by CertX") {
+		t.Errorf("deploy plan view:\n%s", out)
 	}
 	m = press(m, "esc", "w")
 	if !strings.Contains(m.View(), "Warnings") {

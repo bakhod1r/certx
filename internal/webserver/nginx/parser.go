@@ -14,6 +14,7 @@ import (
 type token struct {
 	text   string
 	line   int
+	off    int
 	quoted bool
 }
 
@@ -33,10 +34,10 @@ func tokenize(src string) []token {
 				i++
 			}
 		case c == ';' || c == '{' || c == '}':
-			toks = append(toks, token{text: string(c), line: line})
+			toks = append(toks, token{text: string(c), line: line, off: i})
 			i++
 		case c == '"' || c == '\'':
-			start := line
+			start, off := line, i
 			var b strings.Builder
 			for i++; i < len(src) && src[i] != c; i++ {
 				// Like nginx, only \\ and an escaped quote drop the backslash.
@@ -49,7 +50,7 @@ func tokenize(src string) []token {
 				b.WriteByte(src[i])
 			}
 			i++
-			toks = append(toks, token{text: b.String(), line: start, quoted: true})
+			toks = append(toks, token{text: b.String(), line: start, off: off, quoted: true})
 		default:
 			start := i
 			for i < len(src) && !strings.ContainsRune(" \t\r\n;{}", rune(src[i])) {
@@ -62,17 +63,18 @@ func tokenize(src string) []token {
 				}
 				i++
 			}
-			toks = append(toks, token{text: src[start:i], line: line})
+			toks = append(toks, token{text: src[start:i], line: line, off: start})
 		}
 	}
 	return toks
 }
 
 type parser struct {
-	prefix   string
-	files    map[string]bool
-	stack    map[string]bool
-	warnings []string
+	prefix    string
+	noInclude bool // keep include directives as nodes (used when editing a single file)
+	files     map[string]bool
+	stack     map[string]bool
+	warnings  []string
 }
 
 func newParser(prefix string) *parser {
@@ -102,57 +104,66 @@ func (p *parser) parseFile(path string) ([]*conftree.Node, error) {
 }
 
 func (p *parser) parseBlock(file string, toks []token, i *int, nested bool) ([]*conftree.Node, error) {
+	nodes, _, err := p.parseBlockEnd(file, toks, i, nested)
+	return nodes, err
+}
+
+// parseBlockEnd parses directives until the matching "}" and returns it.
+func (p *parser) parseBlockEnd(file string, toks []token, i *int, nested bool) ([]*conftree.Node, token, error) {
 	var nodes []*conftree.Node
+	fail := func(err error) ([]*conftree.Node, token, error) { return nil, token{}, err }
 	for *i < len(toks) {
 		t := toks[*i]
 		if !t.quoted && t.text == "}" {
 			if !nested {
-				return nil, fmt.Errorf("%s:%d: unexpected \"}\"", file, t.line)
+				return fail(fmt.Errorf("%s:%d: unexpected \"}\"", file, t.line))
 			}
 			*i++
-			return nodes, nil
+			return nodes, t, nil
 		}
 		if !t.quoted && (t.text == ";" || t.text == "{") {
-			return nil, fmt.Errorf("%s:%d: unexpected %q", file, t.line, t.text)
+			return fail(fmt.Errorf("%s:%d: unexpected %q", file, t.line, t.text))
 		}
-		n := &conftree.Node{Name: t.text, File: file, Line: t.line}
+		n := &conftree.Node{Name: t.text, File: file, Line: t.line, Offset: t.off}
 		*i++
 	args:
 		for {
 			if *i >= len(toks) {
-				return nil, fmt.Errorf("%s:%d: unexpected end of file", file, n.Line)
+				return fail(fmt.Errorf("%s:%d: unexpected end of file", file, n.Line))
 			}
 			t = toks[*i]
 			switch {
 			case !t.quoted && t.text == ";":
 				*i++
+				n.EndLine, n.EndOffset = t.line, t.off
 				break args
 			case !t.quoted && t.text == "{":
 				*i++
 				n.Block = true
-				children, err := p.parseBlock(file, toks, i, true)
+				children, end, err := p.parseBlockEnd(file, toks, i, true)
 				if err != nil {
-					return nil, err
+					return fail(err)
 				}
 				n.Children = children
+				n.EndLine, n.EndOffset = end.line, end.off
 				break args
 			case !t.quoted && t.text == "}":
-				return nil, fmt.Errorf("%s:%d: unexpected \"}\"", file, t.line)
+				return fail(fmt.Errorf("%s:%d: unexpected \"}\"", file, t.line))
 			default:
 				n.Args = append(n.Args, t.text)
 				*i++
 			}
 		}
-		if n.Name == "include" && !n.Block {
+		if n.Name == "include" && !n.Block && !p.noInclude {
 			nodes = append(nodes, p.include(n)...)
 			continue
 		}
 		nodes = append(nodes, n)
 	}
 	if nested {
-		return nil, fmt.Errorf("%s: unexpected end of file, expecting \"}\"", file)
+		return fail(fmt.Errorf("%s: unexpected end of file, expecting \"}\"", file))
 	}
-	return nodes, nil
+	return nodes, token{}, nil
 }
 
 func (p *parser) include(n *conftree.Node) []*conftree.Node {

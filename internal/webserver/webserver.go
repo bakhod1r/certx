@@ -4,6 +4,7 @@ package webserver
 
 import (
 	"context"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -90,13 +91,68 @@ type Result struct {
 	Warnings []string
 }
 
+// CertPaths are the files a virtual host should use for TLS.
+type CertPaths struct {
+	Cert string `json:"cert"` // full chain: leaf followed by intermediates
+	Key  string `json:"key"`
+}
+
+// TLSOptions tune how TLS is enabled for a virtual host.
+type TLSOptions struct {
+	Redirect bool // add an HTTP to HTTPS redirect when none exists
+}
+
+// Patch is the result of editing the file that defines one virtual host.
+type Patch struct {
+	After []byte     // new content of the virtual host's file; nil when unchanged
+	Extra []FileEdit // additional files to create (e.g. an Apache SSL vhost)
+	Notes []string   // manual follow-ups the operator should know about
+}
+
+// FileEdit is a single file change. Before is compared with the file on disk
+// right before applying so that concurrent edits are never overwritten.
+type FileEdit struct {
+	Server  Kind        `json:"server"`
+	Path    string      `json:"path"`
+	Existed bool        `json:"existed"`
+	Before  []byte      `json:"-"`
+	After   []byte      `json:"-"`
+	Mode    fs.FileMode `json:"mode"`
+	Symlink string      `json:"symlink,omitempty"` // create a symlink pointing here instead of a file
+}
+
+// ChangeSet is a reversible, diffable set of file edits.
+type ChangeSet struct {
+	Label   string     `json:"label"`
+	Edits   []FileEdit `json:"edits"`
+	Servers []Kind     `json:"servers"` // servers to validate and reload
+	Notes   []string   `json:"notes,omitempty"`
+}
+
+// Empty reports whether the change set has nothing to apply.
+func (c *ChangeSet) Empty() bool { return c == nil || len(c.Edits) == 0 }
+
 // Adapter is implemented by every supported web server.
 type Adapter interface {
 	Kind() Kind
 	Detect(ctx context.Context) Installation
 	Discover(ctx context.Context, inst Installation) (*Result, error)
 	Validate(ctx context.Context, inst Installation) (string, error)
+	Reload(ctx context.Context, inst Installation) (string, error)
+
+	// EditTLS returns src (the content of vh.File) changed so that vh serves
+	// the given certificate.
+	EditTLS(src []byte, vh VirtualHost, c CertPaths, o TLSOptions) (*Patch, error)
+	// EditChallenge returns src changed so that vh serves
+	// /.well-known/acme-challenge/ from root.
+	EditChallenge(src []byte, vh VirtualHost, root string) (*Patch, error)
 }
+
+// ChallengeMarker tags temporary ACME challenge configuration.
+const ChallengeMarker = "CertX ACME challenge (temporary)"
+
+// ManagedMarker tags directives written by CertX.
+const ManagedMarker = "managed by CertX"
 
 // FirstExisting returns the first path that exists, or "".
 func FirstExisting(paths []string) string {

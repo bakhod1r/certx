@@ -72,6 +72,7 @@ func splitArgs(s string) []string {
 
 type parser struct {
 	root      string
+	noInclude bool // keep Include directives as nodes (used when editing a single file)
 	fixedRoot bool
 	files     map[string]bool
 	stack     map[string]bool
@@ -105,6 +106,12 @@ func (p *parser) parseFile(path string) ([]*conftree.Node, error) {
 }
 
 func (p *parser) parseSection(file string, lines []line, i *int, closing string) ([]*conftree.Node, error) {
+	nodes, _, err := p.parseSectionEnd(file, lines, i, closing)
+	return nodes, err
+}
+
+// parseSectionEnd parses until the matching close tag and returns its line.
+func (p *parser) parseSectionEnd(file string, lines []line, i *int, closing string) ([]*conftree.Node, int, error) {
 	var nodes []*conftree.Node
 	for *i < len(lines) {
 		l := lines[*i]
@@ -113,20 +120,20 @@ func (p *parser) parseSection(file string, lines []line, i *int, closing string)
 		case strings.HasPrefix(l.text, "</"):
 			name := strings.TrimSpace(strings.TrimSuffix(l.text[2:], ">"))
 			if closing == "" || !strings.EqualFold(name, closing) {
-				return nil, fmt.Errorf("%s:%d: unexpected </%s>", file, l.num, name)
+				return nil, 0, fmt.Errorf("%s:%d: unexpected </%s>", file, l.num, name)
 			}
-			return nodes, nil
+			return nodes, l.num, nil
 		case strings.HasPrefix(l.text, "<"):
 			fields := splitArgs(strings.TrimSpace(strings.TrimSuffix(l.text[1:], ">")))
 			if len(fields) == 0 {
-				return nil, fmt.Errorf("%s:%d: empty section", file, l.num)
+				return nil, 0, fmt.Errorf("%s:%d: empty section", file, l.num)
 			}
 			n := &conftree.Node{Name: fields[0], Args: fields[1:], Block: true, File: file, Line: l.num}
-			children, err := p.parseSection(file, lines, i, fields[0])
+			children, end, err := p.parseSectionEnd(file, lines, i, fields[0])
 			if err != nil {
-				return nil, err
+				return nil, 0, err
 			}
-			n.Children = children
+			n.Children, n.EndLine = children, end
 			nodes = append(nodes, n)
 		default:
 			fields := splitArgs(l.text)
@@ -139,7 +146,7 @@ func (p *parser) parseSection(file string, lines []line, i *int, closing string)
 					p.root = n.Arg(0)
 				}
 			}
-			if n.Is("Include") || n.Is("IncludeOptional") {
+			if (n.Is("Include") || n.Is("IncludeOptional")) && !p.noInclude {
 				nodes = append(nodes, p.include(n, n.Is("IncludeOptional"))...)
 				continue
 			}
@@ -147,9 +154,9 @@ func (p *parser) parseSection(file string, lines []line, i *int, closing string)
 		}
 	}
 	if closing != "" {
-		return nil, fmt.Errorf("%s: missing </%s>", file, closing)
+		return nil, 0, fmt.Errorf("%s: missing </%s>", file, closing)
 	}
-	return nodes, nil
+	return nodes, 0, nil
 }
 
 func (p *parser) include(n *conftree.Node, optional bool) []*conftree.Node {

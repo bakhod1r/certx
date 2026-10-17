@@ -12,6 +12,12 @@ type Node struct {
 	Children []*Node
 	File     string
 	Line     int
+	EndLine  int // line of the closing "}" or "</Section>"
+
+	// Byte offsets of the directive name and of its terminating ";" or
+	// closing "}". Only set by parsers that work on raw bytes (Nginx).
+	Offset    int
+	EndOffset int
 }
 
 // Arg returns the i-th argument or an empty string.

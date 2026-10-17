@@ -91,6 +91,15 @@ func checkKey(info *Info, certPEM []byte, keyPath string) {
 	info.KeyMatch = &match
 }
 
+// InspectPEM describes PEM-encoded certificate data.
+func InspectPEM(data []byte, now time.Time) (*Info, error) {
+	certs, err := parsePEM(data)
+	if err != nil {
+		return nil, err
+	}
+	return describe(certs, "", now), nil
+}
+
 // Remote connects to host:port with the given SNI name and describes the
 // certificate chain that is actually served.
 func Remote(ctx context.Context, host string, port int, sni string, now time.Time) (*Info, error) {

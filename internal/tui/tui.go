@@ -16,13 +16,22 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"github.com/bakhod1r/certx/internal/acme"
 	"github.com/bakhod1r/certx/internal/certificate"
+	"github.com/bakhod1r/certx/internal/deployment"
 	"github.com/bakhod1r/certx/internal/discovery"
+	"github.com/bakhod1r/certx/internal/plan"
 	"github.com/bakhod1r/certx/internal/webserver"
 )
 
+// Options configures the interface.
+type Options struct {
+	Scan    discovery.Options
+	Storage string // CertX state directory, used to preview deploy plans
+}
+
 // Run starts the interactive interface.
-func Run(opts discovery.Options) error {
+func Run(opts Options) error {
 	_, err := tea.NewProgram(newModel(opts), tea.WithAltScreen()).Run()
 	return err
 }
@@ -64,7 +73,7 @@ type remoteResult struct {
 }
 
 type model struct {
-	opts discovery.Options
+	opts Options
 	inv  *discovery.Inventory
 
 	rows   []int // indices into inv.Hosts after filtering and sorting
@@ -91,7 +100,7 @@ type model struct {
 	help          bool
 }
 
-func newModel(opts discovery.Options) model {
+func newModel(opts Options) model {
 	ti := textinput.New()
 	ti.Prompt = "/ "
 	ti.Placeholder = "filter by domain or file"
@@ -112,7 +121,7 @@ func newModel(opts discovery.Options) model {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(m.spin.Tick, scanCmd(m.opts))
+	return tea.Batch(m.spin.Tick, scanCmd(m.opts.Scan))
 }
 
 func scanCmd(opts discovery.Options) tea.Cmd {
@@ -124,9 +133,9 @@ func scanCmd(opts discovery.Options) tea.Cmd {
 	}
 }
 
-func validateCmd(opts discovery.Options, inv *discovery.Inventory) tea.Cmd {
+func validateCmd(inv *discovery.Inventory) tea.Cmd {
 	return func() tea.Msg {
-		return validateDoneMsg{out: discovery.Validate(context.Background(), opts, inv)}
+		return validateDoneMsg{out: discovery.Validate(context.Background(), inv)}
 	}
 }
 
@@ -286,12 +295,12 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "r":
 		if m.busy == "" {
 			m.busy = "Rescanning…"
-			return m, tea.Batch(m.spin.Tick, scanCmd(m.opts))
+			return m, tea.Batch(m.spin.Tick, scanCmd(m.opts.Scan))
 		}
 	case "v":
 		if m.busy == "" && m.inv != nil {
 			m.busy = "Running configuration test…"
-			return m, tea.Batch(m.spin.Tick, validateCmd(m.opts, m.inv))
+			return m, tea.Batch(m.spin.Tick, validateCmd(m.inv))
 		}
 	case "e":
 		if m.busy == "" && m.inv != nil {
@@ -328,7 +337,12 @@ func (m model) updatePager(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.vp.SetContent(m.detail(m.detailIdx))
 			return m, remoteCmd(m.detailIdx, h)
 		}
-	case "n", "p":
+	case "d":
+		if m.view == viewDetail {
+			m.openText("Deploy plan · "+firstName(m.inv.Hosts[m.detailIdx]), m.deployPlan(m.inv.Hosts[m.detailIdx]))
+			return m, nil
+		}
+	case "n", "N":
 		if m.view == viewDetail && len(m.rows) > 0 {
 			pos := indexOf(m.rows, m.detailIdx)
 			if msg.String() == "n" {
@@ -347,6 +361,50 @@ func (m model) updatePager(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.vp, cmd = m.vp.Update(msg)
 	return m, cmd
+}
+
+// deployPlan previews the configuration change `certx deploy` would make.
+func (m model) deployPlan(h discovery.Host) string {
+	names := discovery.PublicNames(h)
+	if len(names) == 0 {
+		return "This host has no public server name; CertX cannot issue a certificate for it."
+	}
+	name, err := acme.CertName(names[0])
+	if err != nil {
+		return err.Error()
+	}
+	paths := acme.Paths(m.opts.Storage, name)
+	cs, err := plan.Changes(m.inv, "deploy", []discovery.Host{h}, plan.TLS(paths, webserver.TLSOptions{}))
+	if err != nil {
+		return errStyle.Render("✖ " + err.Error())
+	}
+	var b strings.Builder
+	b.WriteString(mutedStyle.Render("Certificate: "+paths.Cert) + "\n")
+	b.WriteString(mutedStyle.Render("Commands:    certx issue --domain "+strings.Join(names, " --domain ")+" --deploy") + "\n\n")
+	if cs.Empty() {
+		b.WriteString(okStyle.Render("✔ Configuration already points at the CertX certificate."))
+		return b.String()
+	}
+	for _, line := range strings.Split(strings.TrimRight(deployment.Diff(cs), "\n"), "\n") {
+		switch {
+		case strings.HasPrefix(line, "+++"), strings.HasPrefix(line, "---"):
+			b.WriteString(lipgloss.NewStyle().Bold(true).Render(line))
+		case strings.HasPrefix(line, "@@"):
+			b.WriteString(titleStyle.Render(line))
+		case strings.HasPrefix(line, "+"):
+			b.WriteString(okStyle.Render(line))
+		case strings.HasPrefix(line, "-"):
+			b.WriteString(errStyle.Render(line))
+		default:
+			b.WriteString(line)
+		}
+		b.WriteString("\n")
+	}
+	for _, n := range cs.Notes {
+		b.WriteString(warnStyle.Render("note: "+n) + "\n")
+	}
+	b.WriteString("\n" + mutedStyle.Render("Preview only — nothing was changed."))
+	return b.String()
 }
 
 func (m *model) openText(title, body string) {
