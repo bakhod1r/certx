@@ -66,7 +66,7 @@ func cmdRenew(g *globals) error {
 	}
 	results, err := renewal.Run(ctx, renewal.Options{
 		Inv: inv, Storage: g.storage, DefaultDirectory: dir, DefaultEmail: g.email,
-		WindowDays: g.windowDays, Force: g.force, DryRun: g.dryRun, Domains: g.domains,
+		WindowDays: g.windowDays, Force: g.force, DryRun: g.dryRun, Domains: g.domains, Filter: g.filter,
 		Retry: issuer.DefaultRetry, Out: progress,
 	})
 	if err != nil {
@@ -142,6 +142,12 @@ func cmdRenew(g *globals) error {
 	}
 	if err := state.SaveRun(g.storage, run); err != nil {
 		fmt.Fprintln(os.Stderr, "warning: state:", err)
+	}
+
+	if g.metrics != "" {
+		if err := writeMetrics(g, inv, run); err != nil {
+			fmt.Fprintln(os.Stderr, "warning: metrics:", err)
+		}
 	}
 
 	if msg, ok := renewMessage(renewed, failed, alerts); ok {

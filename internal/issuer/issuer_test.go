@@ -3,6 +3,7 @@ package issuer
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -54,5 +55,18 @@ func TestObtainHonoursContext(t *testing.T) {
 	defer cancel()
 	if _, err := obtainCtx(ctx, acme.Request{}); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestPrepareWildcardNeedsDNS(t *testing.T) {
+	if _, err := Prepare(Request{Domains: []string{"*.example.com"}}); err == nil || !strings.Contains(err.Error(), "--dns") {
+		t.Errorf("err = %v", err)
+	}
+	if _, err := Prepare(Request{Domains: []string{"*.example.com"}, DNS: "nosuch"}); err == nil || !strings.Contains(err.Error(), "unknown DNS provider") {
+		t.Errorf("err = %v", err)
+	}
+	p, err := Prepare(Request{Storage: "/s", Domains: []string{"*.example.com", "example.com"}, DNS: "exec"})
+	if err != nil || p.Name != "_wildcard.example.com" || !p.Challenge.Empty() {
+		t.Errorf("plan = %+v, %v", p, err)
 	}
 }

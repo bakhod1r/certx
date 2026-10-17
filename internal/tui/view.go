@@ -10,6 +10,7 @@ import (
 
 	"github.com/bakhod1r/certx/internal/certificate"
 	"github.com/bakhod1r/certx/internal/discovery"
+	"github.com/bakhod1r/certx/internal/webserver"
 )
 
 func (m model) View() string {
@@ -107,7 +108,7 @@ func (m model) summary() string {
 	parts := []string{fmt.Sprintf("%d hosts", len(m.inv.Hosts))}
 	for _, s := range []discovery.Status{
 		discovery.StatusOK, discovery.StatusExpiring, discovery.StatusExpired, discovery.StatusMismatch,
-		discovery.StatusKeyMismatch, discovery.StatusBadChain, discovery.StatusSelfSigned,
+		discovery.StatusKeyMismatch, discovery.StatusBadChain, discovery.StatusSelfSigned, discovery.StatusWeak,
 		discovery.StatusNotYetValid, discovery.StatusError, discovery.StatusNoTLS,
 	} {
 		if counts[s] > 0 {
@@ -239,6 +240,13 @@ func (m model) detail(idx int) string {
 	b.WriteString(kv("Webroot", orDash(h.Webroot)))
 	b.WriteString(kv("Redirect", yesNo(h.RedirectsToHTTPS, "→ https", "no")))
 	b.WriteString(kv("Managed by", orDash(h.ManagedBy)))
+	if len(h.Protocols) > 0 {
+		p := strings.Join(h.Protocols, " ")
+		if weak := webserver.WeakProtocols(h.Server, h.Protocols); len(weak) > 0 {
+			p += warnStyle.Render("  ⚠ legacy: " + strings.Join(weak, ", "))
+		}
+		b.WriteString(kv("Protocols", p))
+	}
 
 	if h.CertFile != "" {
 		b.WriteString(sectionStyle.Render("Certificate") + "\n")
@@ -310,6 +318,11 @@ func certBlock(c *certificate.Info) string {
 	b.WriteString(kv("Valid", c.NotBefore.Format(time.DateOnly)+" → "+c.NotAfter.Format(time.DateOnly)+"  "+days))
 	b.WriteString(kv("Serial", c.Serial))
 	b.WriteString(kv("SHA-256", c.FingerprintSHA256))
+	alg := c.KeyAlgorithm
+	for _, w := range c.Weak {
+		alg += warnStyle.Render("  ⚠ " + w)
+	}
+	b.WriteString(kv("Public key", alg))
 	chain := fmt.Sprintf("%d certificate(s)", c.ChainLength)
 	switch {
 	case c.SelfSigned:

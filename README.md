@@ -34,6 +34,19 @@ Implemented (P0):
   (including Certbot or manually managed ones).
 - **Logs** — rotated log file, JSON audit trail of issue/renew/deploy/rollback,
   last-run state shown by `certx scheduler status` and the TUI.
+- **Doctor** — checks root, web servers and config tests, ports 80/443,
+  storage and key permissions, DNS-01 credentials, CA reachability and clock
+  skew, DNS/CAA for every site, scheduler and last renewal.
+- **Preflight** — before issuing: domain syntax, A and AAAA records checked
+  separately, private or foreign addresses, port 80 per address family (a
+  broken AAAA record is the classic Let's Encrypt failure) and CAA policy.
+- **DNS-01 and wildcards** — `--dns cloudflare|digitalocean|hetzner|rfc2136|exec`.
+- **Revoke** — revoked certificates are re-issued by the next `renew`.
+- **Weak TLS report** — legacy protocols (`ssl_protocols`, `SSLProtocol`), RSA
+  keys under 2048 bits, SHA-1/MD5 signatures.
+- **Domain filters** — `--exclude '*.internal,staging.*'`, `--allow '*.example.com'`.
+- **Prometheus** — `certx metrics` or `--metrics-file` for the node_exporter
+  textfile collector.
 - **TUI** and scriptable commands with JSON output and CI exit codes.
 
 ## Install
@@ -59,7 +72,31 @@ sudo certx renew --dry-run                    # what would be renewed
 sudo certx scheduler install                  # systemd timer (or cron) running `certx renew`
 sudo certx scheduler status                   # next run, last run, Certbot timers
 sudo certx notify                             # send a test alert
+sudo certx doctor                             # diagnose everything
+sudo certx revoke --domain example.com --reason keyCompromise
+sudo certx metrics --metrics-file /var/lib/node_exporter/textfile/certx.prom
 ```
+
+### Wildcards and DNS-01
+
+```sh
+# credentials in /etc/certx/env, e.g. CLOUDFLARE_DNS_API_TOKEN=...
+sudo certx issue --domain '*.example.com' --domain example.com --dns cloudflare --deploy
+```
+
+| Provider | Credentials |
+|---|---|
+| `cloudflare` | `CLOUDFLARE_DNS_API_TOKEN` (or `CLOUDFLARE_EMAIL` + `CLOUDFLARE_API_KEY`) |
+| `digitalocean` | `DO_AUTH_TOKEN` |
+| `hetzner` | `HETZNER_API_KEY` |
+| `rfc2136` | `RFC2136_NAMESERVER`, `RFC2136_TSIG_KEY`, `RFC2136_TSIG_SECRET` (BIND, PowerDNS, Knot) |
+| `exec` | `EXEC_PATH`: a script called as `script present|cleanup <fqdn> <value>` |
+
+The provider is stored with the certificate, so `renew` uses it again; `certx
+doctor` warns when its credentials are missing. `CERTX_DNS_RESOLVERS` and
+`CERTX_DNS_PROPAGATION_WAIT` tune the propagation check for split-horizon DNS.
+Behind 1:1 NAT, list the public addresses in `CERTX_PUBLIC_IPS` so preflight
+does not warn about them.
 
 ### Automatic renewal
 
@@ -177,20 +214,25 @@ Certbot-managed and skipped unless `--force` is given.
 | `--log-file` | `CERTX_LOG_FILE` | `/var/log/certx/certx.log` |
 | `--timeout` | | `30m` |
 | `--scheduler` | | `auto` (`systemd` or `cron`) |
+| `--dns` | `CERTX_DNS` | HTTP-01 |
+| `--exclude` / `--allow` | `CERTX_EXCLUDE` / `CERTX_ALLOW` | |
+| `--metrics-file` | `CERTX_METRICS_FILE` | |
+| `--reason` | | `unspecified` |
 | `--deploy`, `--redirect`, `--force`, `--dry-run`, `--yes`, `--json`, `--quiet` | | `false` |
 | | `CERTX_ENV_FILE` | `/etc/certx/env` |
 
 ### Statuses
 
-`OK`, `NO TLS`, `SELF-SIGNED`, `EXPIRING`, `BAD CHAIN`, `MISMATCH`,
+`OK`, `NO TLS`, `WEAK TLS`, `SELF-SIGNED`, `EXPIRING`, `BAD CHAIN`, `MISMATCH`,
 `NOT YET VALID`, `KEY MISMATCH`, `EXPIRED`, `ERROR` (ordered by severity).
 `scan` exits with code `2` when an enabled host is `MISMATCH` or worse;
-`renew` exits with `1` when any renewal failed.
+`renew` exits with `1` when any renewal failed; `doctor` exits with `1` on problems.
 
 ## Development
 
 ```sh
 go test ./...
 go vet ./...
-sudo tests/e2e/pebble.sh   # real nginx + apache2 + Pebble test CA (disposable machine only)
+sudo tests/e2e/pebble.sh   # real nginx + apache2 + Pebble: HTTP-01, DNS-01 wildcard, renew,
+                           # revoke, scheduler, metrics, doctor (disposable machine only)
 ```

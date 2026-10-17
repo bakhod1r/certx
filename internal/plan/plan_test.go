@@ -85,3 +85,24 @@ http {
 		t.Errorf("serving = %d", len(s))
 	}
 }
+
+func TestFilterAndCovers(t *testing.T) {
+	f := Filter{Exclude: []string{"*.internal", "staging.*"}}
+	for name, want := range map[string]bool{"a.example.com": true, "db.internal": false, "staging.example.com": false} {
+		if f.Permits(name) != want {
+			t.Errorf("Permits(%q) != %v", name, want)
+		}
+	}
+	allow := Filter{Allow: []string{"*.example.com"}}
+	if !allow.Permits("www.example.com") || allow.Permits("example.org") {
+		t.Error("allowlist")
+	}
+	for _, c := range []struct {
+		pattern, name string
+		want          bool
+	}{{"*.example.com", "www.example.com", true}, {"*.example.com", "a.b.example.com", false}, {"*.example.com", "example.com", false}, {"example.com", "example.com", false}} {
+		if Covers(c.pattern, c.name) != c.want {
+			t.Errorf("Covers(%q, %q) != %v", c.pattern, c.name, c.want)
+		}
+	}
+}

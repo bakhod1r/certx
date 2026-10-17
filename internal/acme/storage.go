@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -23,9 +24,22 @@ type Meta struct {
 	Domains   []string  `json:"domains"`
 	Directory string    `json:"directory"`
 	Email     string    `json:"email,omitempty"`
+	DNS       string    `json:"dns_provider,omitempty"` // DNS-01 provider; empty means HTTP-01
 	Serial    string    `json:"serial"`
 	IssuedAt  time.Time `json:"issued_at"`
 	NotAfter  time.Time `json:"not_after"`
+
+	RevokedSerial string    `json:"revoked_serial,omitempty"`
+	RevokedAt     time.Time `json:"revoked_at,omitzero"`
+}
+
+// SaveMeta rewrites the metadata of a stored certificate.
+func SaveMeta(storage, name string, m *Meta) error {
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	return deployment.AtomicWrite(filepath.Join(storage, "certs", name, "meta.json"), append(data, '\n'), 0o644)
 }
 
 // CertName derives the storage directory name from the primary domain.
@@ -84,6 +98,33 @@ func List(storage string) ([]string, error) {
 		names = append(names, filepath.Base(filepath.Dir(m)))
 	}
 	return names, nil
+}
+
+// Find returns the stored certificate for domain: the one named after it,
+// otherwise the first one whose domains include it.
+func Find(storage, domain string) (string, *Meta, error) {
+	if name, err := CertName(domain); err == nil {
+		if m, err := LoadMeta(storage, name); err == nil {
+			return name, m, nil
+		}
+	}
+	names, err := List(storage)
+	if err != nil {
+		return "", nil, err
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		m, err := LoadMeta(storage, n)
+		if err != nil {
+			continue
+		}
+		for _, d := range m.Domains {
+			if strings.EqualFold(d, domain) {
+				return n, m, nil
+			}
+		}
+	}
+	return "", nil, fmt.Errorf("no CertX certificate for %s (run certx issue first)", domain)
 }
 
 // LoadMeta reads the metadata of a stored certificate.

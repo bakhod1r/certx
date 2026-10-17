@@ -14,6 +14,7 @@ import (
 	"github.com/bakhod1r/certx/internal/certificate"
 	"github.com/bakhod1r/certx/internal/discovery"
 	"github.com/bakhod1r/certx/internal/issuer"
+	"github.com/bakhod1r/certx/internal/plan"
 	"github.com/bakhod1r/certx/internal/webserver"
 )
 
@@ -38,6 +39,7 @@ type Options struct {
 	Force            bool
 	DryRun           bool
 	Domains          []string // restrict to certificates covering any of these
+	Filter           plan.Filter
 	Retry            issuer.Retry
 	Out              io.Writer
 	Now              func() time.Time
@@ -90,6 +92,10 @@ func Run(ctx context.Context, o Options) ([]Result, error) {
 		if len(o.Domains) > 0 && !overlaps(meta.Domains, o.Domains) {
 			continue
 		}
+		if denied := excluded(o.Filter, meta.Domains); denied != "" {
+			results = append(results, Result{Name: name, Domains: meta.Domains, Action: Skipped, Reason: denied + " is excluded by --exclude/--allow"})
+			continue
+		}
 		results = append(results, renewOne(ctx, o, name, meta, now(), out))
 	}
 	return results, nil
@@ -106,6 +112,9 @@ func renewOne(ctx context.Context, o Options, name string, meta *acme.Meta, now 
 		r.Reason = "certificate and key do not match"
 	case !coversAll(info, meta.Domains):
 		r.Reason = "certificate does not cover all configured domains"
+	case meta.RevokedSerial != "" && meta.RevokedSerial == info.Serial:
+		r.NotAfter, r.DaysLeft = info.NotAfter, info.DaysLeft
+		r.Reason = "certificate was revoked"
 	default:
 		r.NotAfter, r.DaysLeft = info.NotAfter, info.DaysLeft
 		if info.DaysLeft > o.WindowDays && !o.Force {
@@ -125,7 +134,7 @@ func renewOne(ctx context.Context, o Options, name string, meta *acme.Meta, now 
 	fmt.Fprintf(out, "Renewing %s (%s)\n", strings.Join(meta.Domains, ", "), r.Reason)
 	req := issuer.Request{
 		Inv: o.Inv, Storage: o.Storage, Directory: or(meta.Directory, o.DefaultDirectory),
-		Email: or(meta.Email, o.DefaultEmail), Domains: meta.Domains, Retry: o.Retry, Out: out,
+		Email: or(meta.Email, o.DefaultEmail), Domains: meta.Domains, DNS: meta.DNS, Retry: o.Retry, Out: out,
 	}
 	p, err := issuer.Prepare(req)
 	if err == nil {
@@ -163,6 +172,9 @@ func renewOne(ctx context.Context, o Options, name string, meta *acme.Meta, now 
 	}
 	r.Action = Renewed
 	for _, d := range meta.Domains {
+		if strings.HasPrefix(d, "*.") {
+			continue // not a connectable host name
+		}
 		if msg := verify(ctx, d, info.FingerprintSHA256); msg != "" {
 			r.Reason = msg
 		}
@@ -198,6 +210,15 @@ func serversUsing(inv *discovery.Inventory, cert string) []webserver.Kind {
 		}
 	}
 	return kinds
+}
+
+func excluded(f plan.Filter, domains []string) string {
+	for _, d := range domains {
+		if !f.Permits(d) {
+			return d
+		}
+	}
+	return ""
 }
 
 func coversAll(info *certificate.Info, domains []string) bool {

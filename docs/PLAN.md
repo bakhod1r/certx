@@ -141,6 +141,8 @@ domains:
 | Bosqich | Natija |
 |---|---|
 | ✅ P0.1–P0.5 | Bajarildi: scan, status/TUI, plan, issue (HTTP-01), deploy, rollback, validate |
+| ✅ P2 | Bajarildi: doctor, DNS/CAA preflight (A/AAAA alohida, IPv6 port 80), revoke, weak TLS hisobot, --exclude/--allow, mavjud sertifikatni qayta ishlatish |
+| ✅ P3 (qisman) | Bajarildi: DNS-01 (cloudflare, digitalocean, hetzner, rfc2136, exec), wildcard, Prometheus metrikalari. Qolgan: multi-server |
 | ✅ P1 | Bajarildi: renew (oyna, retry/backoff, timeout, lock, reload + tekshiruv), systemd/cron scheduler, webhook/Telegram/email, log rotatsiyasi, audit trail, /etc/certx/env |
 | P0.1 | Adapter interfeysi, `execx`, `config`, Nginx adapteri, `scan` |
 | P0.2 | Apache adapteri (Debian/RHEL), parser + `-S` cross-check |

@@ -40,6 +40,7 @@ type VirtualHost struct {
 	ChainFile        string   `json:"chain_file,omitempty"`
 	Webroot          string   `json:"webroot,omitempty"`
 	RedirectsToHTTPS bool     `json:"redirects_to_https"`
+	Protocols        []string `json:"protocols,omitempty"` // ssl_protocols / SSLProtocol in effect
 	ManagedBy        string   `json:"managed_by,omitempty"`
 }
 
@@ -186,6 +187,35 @@ func SplitAddrPort(s string, defPort int) (string, int) {
 		}
 	}
 	return s, defPort
+}
+
+// WeakProtocols returns the legacy protocols enabled by a protocol list
+// (Nginx ssl_protocols or Apache SSLProtocol syntax).
+func WeakProtocols(kind Kind, protocols []string) []string {
+	if len(protocols) == 0 {
+		return nil
+	}
+	legacy := []string{"SSLv2", "SSLv3", "TLSv1", "TLSv1.1"}
+	enabled := map[string]bool{}
+	for _, p := range protocols {
+		switch {
+		case kind == KindApache && strings.EqualFold(p, "all"), kind == KindApache && p == "+all":
+			for _, l := range legacy[1:] { // "all" excludes SSLv2 in Apache 2.4
+				enabled[l] = true
+			}
+		case strings.HasPrefix(p, "-"):
+			delete(enabled, strings.TrimPrefix(p, "-"))
+		default:
+			enabled[strings.TrimPrefix(p, "+")] = true
+		}
+	}
+	var out []string
+	for _, l := range legacy {
+		if enabled[l] {
+			out = append(out, l)
+		}
+	}
+	return out
 }
 
 // ManagedBy guesses which client manages a certificate path.

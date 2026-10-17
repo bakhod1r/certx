@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -24,6 +23,7 @@ import (
 	"github.com/bakhod1r/certx/internal/issuer"
 	"github.com/bakhod1r/certx/internal/logx"
 	"github.com/bakhod1r/certx/internal/plan"
+	"github.com/bakhod1r/certx/internal/preflight"
 	"github.com/bakhod1r/certx/internal/webserver"
 )
 
@@ -83,7 +83,7 @@ func cmdPlan(g *globals) error {
 	if err != nil {
 		return err
 	}
-	actions := plan.Actions(inv, plan.Options{Domains: g.domains, Force: g.force})
+	actions := plan.Actions(inv, plan.Options{Domains: g.domains, Force: g.force, Filter: g.filter})
 
 	type jsonAction struct {
 		Server   webserver.Kind `json:"server"`
@@ -163,8 +163,16 @@ func cmdPlan(g *globals) error {
 func issueCommand(names []string) string {
 	var b strings.Builder
 	b.WriteString("certx issue")
+	wildcard := false
 	for _, n := range names {
+		if strings.HasPrefix(n, "*.") {
+			wildcard = true
+			n = "'" + n + "'"
+		}
 		b.WriteString(" --domain " + n)
+	}
+	if wildcard {
+		b.WriteString(" --dns <provider>")
 	}
 	b.WriteString(" --deploy")
 	return b.String()
@@ -180,14 +188,29 @@ func cmdIssue(g *globals) error {
 	if err != nil {
 		return err
 	}
+	for _, d := range g.domains {
+		if !g.filter.Permits(d) {
+			return fmt.Errorf("%s is excluded by --exclude/--allow", d)
+		}
+	}
+	if existing := reusable(g); existing != nil {
+		fmt.Printf("✔ A valid certificate already exists for %s (%d days left, expires %s); use --force to replace it\n",
+			strings.Join(g.domains, ", "), existing.DaysLeft, existing.NotAfter.Format(time.DateOnly))
+		if !g.deploy {
+			return nil
+		}
+		return cmdDeploy(g)
+	}
 	inv, err := scan(g)
 	if err != nil {
 		return err
 	}
-	preflight(g.domains)
+	if err := runPreflight(g, dir); err != nil {
+		return err
+	}
 
 	req := issuer.Request{
-		Inv: inv, Storage: g.storage, Directory: dir, Email: g.email, Domains: g.domains,
+		Inv: inv, Storage: g.storage, Directory: dir, Email: g.email, Domains: g.domains, DNS: g.dns,
 		Webroot: g.webroot, Retry: issuer.Retry{Attempts: 2, Delay: 10 * time.Second}, Out: os.Stdout,
 	}
 	p, err := issuer.Prepare(req)
@@ -197,7 +220,11 @@ func cmdIssue(g *globals) error {
 	fmt.Printf("Certificate:  %s\n", strings.Join(g.domains, ", "))
 	fmt.Printf("CA:           %s\n", dir)
 	fmt.Printf("Storage:      %s\n", filepath.Dir(p.Paths.Cert))
-	fmt.Printf("Challenge:    HTTP-01 from %s\n", p.Webroot)
+	if g.dns != "" {
+		fmt.Printf("Challenge:    DNS-01 via %s\n", g.dns)
+	} else {
+		fmt.Printf("Challenge:    HTTP-01 from %s\n", p.Webroot)
+	}
 	if dir == acme.LetsEncryptStaging {
 		fmt.Println("Note:         staging certificates are not trusted by browsers; use --acme production when ready")
 	}
@@ -242,23 +269,55 @@ func cmdIssue(g *globals) error {
 	return cmdDeploy(g)
 }
 
-// preflight prints DNS warnings; ownership is proven by the ACME challenge.
-func preflight(domains []string) {
-	for _, d := range domains {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		ips, err := net.DefaultResolver.LookupIPAddr(ctx, d)
-		cancel()
-		switch {
-		case err != nil:
-			fmt.Fprintf(os.Stderr, "warning: %s does not resolve: %v\n", d, err)
-		case len(ips) > 0:
-			var s []string
-			for _, ip := range ips {
-				s = append(s, ip.String())
-			}
-			fmt.Printf("DNS:          %s → %s\n", d, strings.Join(s, ", "))
+// reusable returns the stored certificate when it already covers the
+// requested domains and is outside the renewal window.
+func reusable(g *globals) *certificate.Info {
+	if g.force {
+		return nil
+	}
+	name, meta, err := acme.Find(g.storage, g.domains[0])
+	if err != nil {
+		return nil
+	}
+	p := acme.Paths(g.storage, name)
+	info, err := certificate.Inspect(p.Cert, p.Key, time.Now())
+	if err != nil || info.KeyMatch == nil || !*info.KeyMatch || info.DaysLeft <= g.windowDays || meta.RevokedSerial == info.Serial {
+		return nil
+	}
+	for _, d := range g.domains {
+		if !info.Covers(d) {
+			return nil
 		}
 	}
+	return info
+}
+
+// runPreflight prints DNS, port and CAA checks and stops on failures that
+// would make the CA refuse; --force overrides. Ownership is proven only by
+// the ACME challenge itself.
+func runPreflight(g *globals, directory string) error {
+	opts := preflight.Options{CAIdentities: preflight.CAIdentities(directory), SkipPort: g.dns != ""}
+	var failed []string
+	for _, d := range g.domains {
+		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		checks := preflight.Domain(ctx, d, opts)
+		cancel()
+		for _, c := range checks {
+			sev := c.Severity
+			if g.dns != "" && (c.Name == "dns" || strings.HasPrefix(c.Name, "port")) && sev == preflight.Fail {
+				sev = preflight.Warn // DNS-01 does not need the name to resolve to this host
+			}
+			mark := map[preflight.Severity]string{preflight.OK: "✔", preflight.Warn: "⚠", preflight.Fail: "✖"}[sev]
+			fmt.Printf("Preflight:    %s %-14s %s %s\n", mark, c.Name, d, c.Detail)
+			if sev == preflight.Fail {
+				failed = append(failed, d+": "+c.Detail)
+			}
+		}
+	}
+	if len(failed) > 0 && !g.force {
+		return fmt.Errorf("preflight failed (use --force to try anyway):\n  %s", strings.Join(failed, "\n  "))
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------- deploy
@@ -267,7 +326,7 @@ func cmdDeploy(g *globals) error {
 	if len(g.domains) == 0 {
 		return errors.New("--domain is required")
 	}
-	name, err := acme.CertName(g.domains[0])
+	name, _, err := acme.Find(g.storage, g.domains[0])
 	if err != nil {
 		return err
 	}
@@ -290,7 +349,12 @@ func cmdDeploy(g *globals) error {
 		return err
 	}
 	var hosts []discovery.Host
-	for _, a := range plan.Actions(inv, plan.Options{Domains: g.domains, Force: g.force}) {
+	for _, d := range g.domains {
+		if !g.filter.Permits(d) {
+			return fmt.Errorf("%s is excluded by --exclude/--allow", d)
+		}
+	}
+	for _, a := range plan.Actions(inv, plan.Options{Domains: g.domains, Force: g.force, Filter: g.filter}) {
 		if a.Host.ManagedBy == "certbot" && !g.force {
 			fmt.Printf("– skipping %s: %s\n", a.Host.Location(), "certificate is managed by Certbot (use --force)")
 			continue
@@ -338,7 +402,9 @@ func cmdDeploy(g *globals) error {
 	fmt.Printf("✔ Deployed (backup %s; undo with: certx rollback %s)\n", m.ID, m.ID)
 
 	for _, d := range g.domains {
-		verifyServed(d, local.FingerprintSHA256)
+		if !strings.HasPrefix(d, "*.") { // a wildcard is not a connectable host name
+			verifyServed(d, local.FingerprintSHA256)
+		}
 	}
 	return nil
 }
@@ -475,4 +541,8 @@ func printWarnings(inv *discovery.Inventory) {
 	for _, w := range inv.Warnings {
 		fmt.Fprintln(os.Stderr, "warning:", w)
 	}
+}
+
+func atomicWrite(path string, data []byte) error {
+	return deployment.AtomicWrite(path, data, 0o644)
 }

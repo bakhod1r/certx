@@ -37,7 +37,7 @@ func statusStyle(s discovery.Status) lipgloss.Style {
 		return okStyle
 	case discovery.StatusNoTLS:
 		return mutedStyle
-	case discovery.StatusSelfSigned, discovery.StatusExpiring, discovery.StatusBadChain:
+	case discovery.StatusSelfSigned, discovery.StatusExpiring, discovery.StatusBadChain, discovery.StatusWeak:
 		return warnStyle
 	default:
 		return errStyle
@@ -51,7 +51,7 @@ func statusLabel(s discovery.Status) string {
 		icon = "✔"
 	case discovery.StatusNoTLS:
 		icon = "○"
-	case discovery.StatusSelfSigned, discovery.StatusBadChain:
+	case discovery.StatusSelfSigned, discovery.StatusBadChain, discovery.StatusWeak:
 		icon = "◐"
 	case discovery.StatusExpiring:
 		icon = "⚠"

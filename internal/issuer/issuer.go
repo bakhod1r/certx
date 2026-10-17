@@ -17,6 +17,7 @@ import (
 	"github.com/bakhod1r/certx/internal/deployment"
 	"github.com/bakhod1r/certx/internal/discovery"
 	"github.com/bakhod1r/certx/internal/plan"
+	"github.com/bakhod1r/certx/internal/preflight"
 	"github.com/bakhod1r/certx/internal/webserver"
 )
 
@@ -37,6 +38,7 @@ type Request struct {
 	Email     string
 	Domains   []string
 	Webroot   string // existing webroot; empty means a temporary challenge snippet
+	DNS       string // DNS-01 provider; required for wildcards, replaces HTTP-01
 	Retry     Retry
 	Out       io.Writer // progress output; nil discards
 }
@@ -54,14 +56,25 @@ func Prepare(req Request) (*Plan, error) {
 	if len(req.Domains) == 0 {
 		return nil, errors.New("no domains")
 	}
-	for _, d := range req.Domains {
-		if _, err := acme.CertName(d); err != nil || strings.HasPrefix(d, "*.") {
-			return nil, fmt.Errorf("invalid domain %q (wildcards need DNS-01, which is not supported yet)", d)
+	if req.DNS != "" {
+		if err := acme.ValidDNSProvider(req.DNS); err != nil {
+			return nil, err
 		}
 	}
-	name, _ := acme.CertName(req.Domains[0])
+	for _, d := range req.Domains {
+		if err := preflight.Syntax(d); err != nil {
+			return nil, err
+		}
+		if strings.HasPrefix(d, "*.") && req.DNS == "" {
+			return nil, fmt.Errorf("%s: wildcard certificates need DNS-01; pass --dns <provider>", d)
+		}
+	}
+	name, err := acme.CertName(req.Domains[0])
+	if err != nil {
+		return nil, err
+	}
 	p := &Plan{Name: name, Paths: acme.Paths(req.Storage, name), Webroot: req.Webroot}
-	if p.Webroot != "" {
+	if p.Webroot != "" || req.DNS != "" {
 		return p, nil
 	}
 	p.Webroot = filepath.Join(req.Storage, "acme-challenge")
@@ -88,8 +101,10 @@ func Execute(ctx context.Context, req Request, p *Plan) (*certificate.Info, erro
 	backups := filepath.Join(req.Storage, "backups")
 	targets := Targets(req.Inv)
 
-	if err := os.MkdirAll(filepath.Join(p.Webroot, ".well-known", "acme-challenge"), 0o755); err != nil {
-		return nil, err
+	if req.DNS == "" {
+		if err := os.MkdirAll(filepath.Join(p.Webroot, ".well-known", "acme-challenge"), 0o755); err != nil {
+			return nil, err
+		}
 	}
 	var applied *deployment.Manifest
 	if !p.Challenge.Empty() {
@@ -100,8 +115,11 @@ func Execute(ctx context.Context, req Request, p *Plan) (*certificate.Info, erro
 		}
 	}
 
-	step("Checking that the challenge is reachable locally")
-	err := acme.SelfTest(ctx, p.Webroot, req.Domains, "127.0.0.1")
+	var err error
+	if req.DNS == "" {
+		step("Checking that the challenge is reachable locally")
+		err = acme.SelfTest(ctx, p.Webroot, req.Domains, "127.0.0.1")
+	}
 	var bundle *acme.Bundle
 	if err == nil {
 		bundle, err = obtain(ctx, req, p.Webroot, step)
@@ -122,7 +140,7 @@ func Execute(ctx context.Context, req Request, p *Plan) (*certificate.Info, erro
 		return nil, err
 	}
 	_, err = acme.Save(req.Storage, p.Name, bundle, acme.Meta{
-		Domains: req.Domains, Directory: req.Directory, Email: req.Email,
+		Domains: req.Domains, Directory: req.Directory, Email: req.Email, DNS: req.DNS,
 		Serial: info.Serial, IssuedAt: time.Now().UTC(), NotAfter: info.NotAfter,
 	})
 	return info, err
@@ -138,7 +156,7 @@ func obtain(ctx context.Context, req Request, webroot string, step func(string))
 	for attempt := 1; ; attempt++ {
 		step("Requesting certificate")
 		b, err := obtainCtx(ctx, acme.Request{
-			Storage: req.Storage, Directory: req.Directory, Email: req.Email, Domains: req.Domains, Webroot: webroot,
+			Storage: req.Storage, Directory: req.Directory, Email: req.Email, Domains: req.Domains, Webroot: webroot, DNS: req.DNS,
 		})
 		if err == nil || attempt >= r.Attempts || !Transient(err) {
 			return b, err

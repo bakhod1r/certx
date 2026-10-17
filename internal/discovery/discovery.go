@@ -22,6 +22,7 @@ const (
 	StatusOK          Status = "OK"
 	StatusNoTLS       Status = "NO TLS"
 	StatusSelfSigned  Status = "SELF-SIGNED"
+	StatusWeak        Status = "WEAK TLS"
 	StatusExpiring    Status = "EXPIRING"
 	StatusBadChain    Status = "BAD CHAIN"
 	StatusMismatch    Status = "MISMATCH"
@@ -32,8 +33,8 @@ const (
 )
 
 var severity = map[Status]int{
-	StatusOK: 0, StatusNoTLS: 1, StatusSelfSigned: 2, StatusExpiring: 3, StatusBadChain: 4,
-	StatusMismatch: 5, StatusNotYetValid: 6, StatusKeyMismatch: 7, StatusExpired: 8, StatusError: 9,
+	StatusOK: 0, StatusNoTLS: 1, StatusWeak: 2, StatusSelfSigned: 3, StatusExpiring: 4, StatusBadChain: 5,
+	StatusMismatch: 6, StatusNotYetValid: 7, StatusKeyMismatch: 8, StatusExpired: 9, StatusError: 10,
 }
 
 // Severity returns a sortable rank; higher is worse.
@@ -235,6 +236,12 @@ func evaluate(h *Host, warnDays int, now time.Time) {
 		raise(StatusSelfSigned, "self-signed certificate")
 	} else if info.ChainError != "" {
 		raise(StatusBadChain, "chain: "+info.ChainError)
+	}
+	for _, w := range info.Weak {
+		raise(StatusWeak, "weak certificate: "+w)
+	}
+	if weak := webserver.WeakProtocols(h.Server, h.Protocols); len(weak) > 0 {
+		raise(StatusWeak, "legacy protocols enabled: "+strings.Join(weak, ", "))
 	}
 	if !h.TLS() {
 		h.Issues = append(h.Issues, "certificate configured but no TLS listener")

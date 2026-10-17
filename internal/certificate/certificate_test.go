@@ -1,6 +1,12 @@
 package certificate_test
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
 	"path/filepath"
 	"testing"
 	"time"
@@ -39,5 +45,22 @@ func TestInspectSelfSigned(t *testing.T) {
 
 	if _, err := certificate.Inspect(filepath.Join(dir, "missing.pem"), "", now); err == nil {
 		t.Error("expected error for missing file")
+	}
+}
+
+func TestWeakKey(t *testing.T) {
+	key, _ := rsa.GenerateKey(rand.Reader, 1024)
+	tmpl := &x509.Certificate{SerialNumber: big.NewInt(1), Subject: pkix.Name{CommonName: "weak.example"},
+		DNSNames: []string{"weak.example"}, NotBefore: time.Now(), NotAfter: time.Now().Add(time.Hour)}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := certificate.InspectPEM(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.KeyAlgorithm != "RSA 1024" || len(info.Weak) != 1 {
+		t.Errorf("alg=%s weak=%v", info.KeyAlgorithm, info.Weak)
 	}
 }

@@ -48,12 +48,22 @@ json.dump(c, open(out, "w"))
 PY
 PEBBLE_VA_NOSLEEP=1 PEBBLE_WFE_NONCEREJECT=0 "$BIN/pebble" -config "$WORK/pebble.json" -dnsserver 127.0.0.1:8053 >"$WORK/pebble.log" 2>&1 &
 PIDS+=($!)
-"$BIN/pebble-challtestsrv" -defaultIPv4 127.0.0.1 -defaultIPv6 "" -dns01 :8053 -http01 "" -https01 "" -tlsalpn01 "" -doh "" >"$WORK/chall.log" 2>&1 &
+"$BIN/pebble-challtestsrv" -defaultIPv4 127.0.0.1 -defaultIPv6 "" -dns01 :8053 -http01 "" -https01 "" -tlsalpn01 "" -doh "" -management :8055 >"$WORK/chall.log" 2>&1 &
 PIDS+=($!)
 mkdir -p "$WORK/www" && echo "hello from backend" >"$WORK/www/index.html"
 python3 -m http.server 9000 -d "$WORK/www" >/dev/null 2>&1 &
 PIDS+=($!)
-grep -q certx.test /etc/hosts || echo "127.0.0.1 app.certx.test www.app.certx.test blog.certx.test" >>/etc/hosts
+grep -q wild.certx.test /etc/hosts || echo "127.0.0.1 app.certx.test www.app.certx.test blog.certx.test wild.certx.test a.wild.certx.test" >>/etc/hosts
+# DNS-01 through lego's exec provider and the challtestsrv management API.
+cat >"$WORK/dns-hook.sh" <<'SH'
+#!/bin/sh
+case "$1" in
+  present) curl -sf --noproxy '*' -d "{\"host\":\"$2\",\"value\":\"$3\"}" http://127.0.0.1:8055/set-txt ;;
+  cleanup) curl -sf --noproxy '*' -d "{\"host\":\"$2\"}" http://127.0.0.1:8055/clear-txt ;;
+esac
+SH
+chmod 755 "$WORK/dns-hook.sh"
+export EXEC_PATH="$WORK/dns-hook.sh" CERTX_DNS_PROPAGATION_WAIT=2s # challtestsrv does not answer SOA
 sleep 2
 
 check_https() { # domain
@@ -84,10 +94,40 @@ certx renew --server nginx --domain app.certx.test --acme "$ACME" --dry-run
 certx renew --server nginx --domain app.certx.test --acme "$ACME" --force
 AFTER=$(serial app.certx.test)
 [ "$BEFORE" != "$AFTER" ] || { echo "renew did not change the served certificate"; exit 1; }
-certx renew --server nginx --domain app.certx.test --acme "$ACME" | grep -q "valid for" # idempotent: skipped now
+certx renew --server nginx --domain app.certx.test --acme "$ACME" --window-days 1 | grep -q "valid for" # idempotent: skipped now (Pebble may issue short-lived certificates)
 certx scheduler install --scheduler cron --yes
 certx scheduler status
 certx scheduler uninstall --yes
+if command -v systemd-analyze >/dev/null; then
+  UNITS="$WORK/units" && mkdir -p "$UNITS"
+  certx scheduler install --scheduler systemd --dry-run | awk -v d="$UNITS" '/^--- /{f=d"/"substr($2, match($2, /[^\/]+$/)); next} /^Dry run/{f=""} f{print > f}'
+  systemd-analyze verify --man=no "$UNITS/certx-renew.service" "$UNITS/certx-renew.timer"
+fi
+
+step "Nginx: wildcard over DNS-01, revoke, metrics, doctor"
+cat >/etc/nginx/sites-available/wild.conf <<'CONF'
+server {
+    listen 80;
+    server_name wild.certx.test *.wild.certx.test;
+    location / { proxy_pass http://127.0.0.1:9000; }
+}
+CONF
+ln -sf /etc/nginx/sites-available/wild.conf /etc/nginx/sites-enabled/wild.conf
+nginx -s reload && sleep 1
+if certx issue --server nginx --domain '*.wild.certx.test' --acme "$ACME" --yes 2>/dev/null; then
+  echo "wildcard without --dns must be refused"; exit 1
+fi
+certx issue --server nginx --domain '*.wild.certx.test' --domain wild.certx.test --dns exec --acme "$ACME" --deploy --redirect --yes
+check_https a.wild.certx.test
+certx issue --server nginx --domain '*.wild.certx.test' --domain wild.certx.test --dns exec --acme "$ACME" --yes | grep -q "already exists"
+certx revoke --domain wild.certx.test --reason superseded --yes
+certx renew --server nginx --domain wild.certx.test --dry-run | grep -q "certificate was revoked"
+certx renew --server nginx --domain wild.certx.test
+certx metrics --server nginx | grep -q 'certx_managed_certificate_expiry_timestamp_seconds{name="_wildcard.wild.certx.test"}'
+certx doctor --server nginx --acme "$ACME" || true
+ID=$(certx rollback --list | awk '/deploy _wildcard/ && /applied/ {print $1; exit}')
+certx rollback --server nginx --yes "$ID"
+rm -f /etc/nginx/sites-enabled/wild.conf
 ID=$(certx rollback --list | awk '/deploy app/ && /applied/ {print $1; exit}')
 certx rollback --server nginx --yes "$ID"
 nginx -s stop

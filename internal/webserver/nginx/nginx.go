@@ -104,7 +104,10 @@ func (a *Adapter) Validate(ctx context.Context, inst webserver.Installation) (st
 	return execx.Run(ctx, inst.Binary, args...)
 }
 
-type inherited struct{ cert, key string }
+type inherited struct {
+	cert, key string
+	protocols []string
+}
 
 func collect(nodes []*conftree.Node, prefix string, inHTTP bool, inh inherited, enabled bool, out *[]webserver.VirtualHost) {
 	if inHTTP {
@@ -114,6 +117,8 @@ func collect(nodes []*conftree.Node, prefix string, inHTTP bool, inh inherited, 
 				inh.cert = resolve(prefix, n.Arg(0))
 			case "ssl_certificate_key":
 				inh.key = resolve(prefix, n.Arg(0))
+			case "ssl_protocols":
+				inh.protocols = n.Args
 			}
 		}
 	}
@@ -146,6 +151,8 @@ func serverToHost(n *conftree.Node, prefix string, inh inherited, enabled bool) 
 			vh.KeyFile = resolve(prefix, d.Arg(0))
 		case "ssl":
 			sslOn = d.Arg(0) == "on"
+		case "ssl_protocols":
+			vh.Protocols = d.Args
 		case "root":
 			vh.Webroot = d.Arg(0)
 		}
@@ -167,6 +174,11 @@ func serverToHost(n *conftree.Node, prefix string, inh inherited, enabled bool) 
 		if vh.KeyFile == "" {
 			vh.KeyFile = inh.key
 		}
+		if vh.Protocols == nil {
+			vh.Protocols = inh.protocols
+		}
+	} else {
+		vh.Protocols = nil
 	}
 	vh.ManagedBy = webserver.ManagedBy(vh.CertFile)
 	return vh

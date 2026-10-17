@@ -64,6 +64,7 @@ type Request struct {
 	Email     string
 	Domains   []string
 	Webroot   string // HTTP-01 files are written to <Webroot>/.well-known/acme-challenge/
+	DNS       string // DNS-01 provider name; when set, HTTP-01 is not used
 }
 
 // Bundle holds PEM-encoded certificate material.
@@ -122,6 +123,16 @@ func newClient(user *account, req Request) (*lego.Client, error) {
 	if err != nil {
 		return nil, explain(err)
 	}
+	if req.DNS != "" {
+		provider, opts, err := dnsProvider(req.DNS)
+		if err != nil {
+			return nil, err
+		}
+		if err := client.Challenge.SetDNS01Provider(provider, opts...); err != nil {
+			return nil, err
+		}
+		return client, nil
+	}
 	provider, err := webroot.NewHTTPProvider(req.Webroot)
 	if err != nil {
 		return nil, err
@@ -130,6 +141,38 @@ func newClient(user *account, req Request) (*lego.Client, error) {
 		return nil, err
 	}
 	return client, nil
+}
+
+// Revocation reasons (RFC 5280).
+var RevocationReasons = map[string]uint{
+	"unspecified": 0, "keyCompromise": 1, "superseded": 4, "cessationOfOperation": 5,
+}
+
+// Revoke revokes the PEM certificate with the account that issued it.
+func Revoke(storage, directory, email string, certPEM []byte, reason uint) error {
+	user, err := loadAccount(storage, directory, email)
+	if err != nil {
+		return fmt.Errorf("account: %w", err)
+	}
+	if user.Registration == nil {
+		return fmt.Errorf("no ACME account for %s at %s", or(email, "default"), directory)
+	}
+	client, err := newClient(user, Request{Directory: directory, Webroot: os.TempDir()})
+	if err != nil {
+		return err
+	}
+	err = client.Certificate.RevokeWithReason(certPEM, &reason)
+	if err != nil && strings.Contains(err.Error(), "alreadyRevoked") {
+		return nil // e.g. an earlier run revoked it but was interrupted before recording it
+	}
+	return explain(err)
+}
+
+func or(a, b string) string {
+	if a != "" {
+		return a
+	}
+	return b
 }
 
 func register(client *lego.Client, user *account) error {
@@ -153,6 +196,9 @@ var rateLimitRe = regexp.MustCompile(`(?i)rateLimited|too many (certificates|fai
 
 // explain turns common ACME failures into actionable messages.
 func explain(err error) error {
+	if err == nil {
+		return nil
+	}
 	msg := err.Error()
 	switch {
 	case rateLimitRe.MatchString(msg):

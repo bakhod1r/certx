@@ -83,6 +83,13 @@ func (a *Adapter) Discover(_ context.Context, inst webserver.Installation) (*web
 	}
 	res := &webserver.Result{}
 	collect(nodes, p.root, true, &res.Hosts)
+	if global := globalProtocols(nodes); global != nil {
+		for i := range res.Hosts {
+			if res.Hosts[i].TLS() && res.Hosts[i].Protocols == nil {
+				res.Hosts[i].Protocols = global
+			}
+		}
+	}
 
 	// Debian layout: sites-available entries not linked into sites-enabled.
 	available, _ := filepath.Glob(filepath.Join(p.root, "sites-available", "*.conf"))
@@ -166,6 +173,8 @@ func vhostToHost(n *conftree.Node, root string, enabled bool) webserver.VirtualH
 				vh.ChainFile = resolve(root, d.Arg(0))
 			case "documentroot":
 				vh.Webroot = d.Arg(0)
+			case "sslprotocol":
+				vh.Protocols = d.Args
 			case "redirect", "redirectpermanent", "redirectmatch", "rewriterule":
 				if strings.Contains(strings.Join(d.Args, " "), "https://") {
 					vh.RedirectsToHTTPS = true
@@ -185,6 +194,23 @@ func vhostToHost(n *conftree.Node, root string, enabled bool) webserver.VirtualH
 	}
 	vh.ManagedBy = webserver.ManagedBy(vh.CertFile)
 	return vh
+}
+
+// globalProtocols returns the last server-wide SSLProtocol directive.
+func globalProtocols(nodes []*conftree.Node) []string {
+	var out []string
+	for _, n := range nodes {
+		switch {
+		case n.Block && n.Is("VirtualHost"):
+		case n.Block:
+			if p := globalProtocols(n.Children); p != nil {
+				out = p
+			}
+		case n.Is("SSLProtocol"):
+			out = n.Args
+		}
+	}
+	return out
 }
 
 func cleanName(s string) string {

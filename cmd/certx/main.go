@@ -16,6 +16,7 @@ import (
 	"github.com/bakhod1r/certx/internal/config"
 	"github.com/bakhod1r/certx/internal/discovery"
 	"github.com/bakhod1r/certx/internal/lockfile"
+	"github.com/bakhod1r/certx/internal/plan"
 	"github.com/bakhod1r/certx/internal/tui"
 	"github.com/bakhod1r/certx/internal/webserver"
 )
@@ -38,6 +39,9 @@ Commands:
   deploy     Point virtual hosts at a CertX certificate (backup, test, reload)
   rollback   List backups or restore one
   renew      Renew CertX certificates inside the renewal window (for timers)
+  revoke     Revoke a CertX certificate (it is re-issued by the next renew)
+  doctor     Diagnose the environment: servers, ports, DNS, CAA, CA, storage
+  metrics    Print Prometheus metrics (or write them with --metrics-file)
   scheduler  install | status | uninstall the twice-daily renewal job
   notify     Send a test notification to the configured channels
   validate   Run nginx -t / apachectl -t
@@ -47,6 +51,7 @@ Examples:
   certx plan
   certx issue  --domain example.com --domain www.example.com --email ops@example.com
   certx issue  --domain example.com --acme production --deploy --redirect
+  certx issue  --domain '*.example.com' --domain example.com --dns cloudflare --deploy
   certx deploy --domain example.com --dry-run
   certx rollback --list
   certx renew --dry-run
@@ -91,6 +96,10 @@ type globals struct {
 	quiet      bool
 	logFile    string
 	scheduler  string
+	dns        string
+	reason     string
+	metrics    string
+	filter     plan.Filter
 	setFlags   []string // flags given explicitly, forwarded to the scheduled job
 
 	locked bool // the run lock is already held by this process
@@ -169,14 +178,22 @@ func run(args []string) error {
 	fs.BoolVar(&g.quiet, "quiet", false, "only print renewals, failures and alerts (renew)")
 	fs.StringVar(&g.logFile, "log-file", envOr("CERTX_LOG_FILE", "/var/log/certx/certx.log"), "renew log file (rotated); empty disables")
 	fs.StringVar(&g.scheduler, "scheduler", "auto", "scheduler backend: auto, systemd or cron")
+	fs.StringVar(&g.dns, "dns", os.Getenv("CERTX_DNS"), "DNS-01 provider (required for wildcards): "+strings.Join(dnsNames(), ", "))
+	fs.StringVar(&g.reason, "reason", "unspecified", "revocation reason: unspecified, keyCompromise, superseded, cessationOfOperation")
+	fs.StringVar(&g.metrics, "metrics-file", os.Getenv("CERTX_METRICS_FILE"), "write Prometheus metrics here (node_exporter textfile collector)")
+	exclude := stringList(splitEnv("CERTX_EXCLUDE"))
+	allow := stringList(splitEnv("CERTX_ALLOW"))
+	fs.Var(&exclude, "exclude", "never manage domains matching these patterns, e.g. '*.internal,staging.*'")
+	fs.Var(&allow, "allow", "only manage domains matching these patterns")
 	positional, err := parseInterspersed(fs, args)
 	if err != nil {
 		return err
 	}
+	g.filter = plan.Filter{Allow: allow, Exclude: exclude}
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
 		case "server", "nginx-conf", "apache-conf", "apache-root", "storage", "acme", "email",
-			"window-days", "alert-days", "warn-days", "log-file", "timeout":
+			"window-days", "alert-days", "warn-days", "log-file", "timeout", "exclude", "allow", "metrics-file":
 			g.setFlags = append(g.setFlags, "--"+f.Name+"="+f.Value.String())
 		}
 	})
@@ -207,6 +224,12 @@ func run(args []string) error {
 		return cmdScheduler(&g, positional)
 	case "notify":
 		return cmdNotify(&g)
+	case "revoke":
+		return cmdRevoke(&g)
+	case "doctor":
+		return cmdDoctor(&g)
+	case "metrics":
+		return cmdMetrics(&g)
 	case "validate":
 		return cmdValidate(&g)
 	case "version":
@@ -239,6 +262,25 @@ func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
 		positional = append(positional, rest[0])
 		args = rest[1:]
 	}
+}
+
+func splitEnv(key string) []string {
+	var out []string
+	for _, p := range strings.Split(os.Getenv(key), ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, strings.ToLower(p))
+		}
+	}
+	return out
+}
+
+func dnsNames() []string {
+	var out []string
+	for _, p := range acme.DNSProviders() {
+		name, _, _ := strings.Cut(p, ":")
+		out = append(out, name)
+	}
+	return out
 }
 
 func envOr(key, def string) string {

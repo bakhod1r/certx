@@ -3,6 +3,7 @@ package acme
 import (
 	"context"
 	"crypto/ecdsa"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -85,5 +86,30 @@ func TestSelfTest(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(filepath.Join(root, ".well-known", "acme-challenge")); len(entries) != 0 {
 		t.Error("token not cleaned up")
+	}
+}
+
+func TestFind(t *testing.T) {
+	dir := t.TempDir()
+	b := &Bundle{Leaf: []byte("l"), Chain: []byte("c"), FullChain: []byte("lc"), PrivateKey: []byte("k")}
+	if _, err := Save(dir, "_wildcard.example.com", b, Meta{Domains: []string{"*.example.com", "example.com"}}); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []string{"*.example.com", "EXAMPLE.com"} {
+		if n, _, err := Find(dir, d); err != nil || n != "_wildcard.example.com" {
+			t.Errorf("Find(%q) = %q, %v", d, n, err)
+		}
+	}
+	if _, _, err := Find(dir, "other.example.com"); err == nil {
+		t.Error("found a certificate that does not include the domain")
+	}
+}
+
+func TestExplainNil(t *testing.T) {
+	if explain(nil) != nil {
+		t.Fatal("explain(nil) must be nil")
+	}
+	if err := explain(errors.New("urn:ietf:params:acme:error:rateLimited")); !strings.Contains(err.Error(), "rate limit") {
+		t.Errorf("err = %v", err)
 	}
 }

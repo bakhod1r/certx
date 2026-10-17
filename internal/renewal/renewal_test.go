@@ -16,6 +16,7 @@ import (
 	"github.com/bakhod1r/certx/internal/deployment"
 	"github.com/bakhod1r/certx/internal/discovery"
 	"github.com/bakhod1r/certx/internal/issuer"
+	"github.com/bakhod1r/certx/internal/plan"
 	"github.com/bakhod1r/certx/internal/webserver"
 )
 
@@ -153,5 +154,34 @@ func TestRunDecisions(t *testing.T) {
 	}
 	if len(executed) != 0 {
 		t.Errorf("re-run issued again: %v", executed)
+	}
+}
+
+func TestRevokedAndExcluded(t *testing.T) {
+	storage := t.TempDir()
+	store(t, storage, "revoked.example.com", 80*24*time.Hour)
+	store(t, storage, "db.internal.example.com", 5*24*time.Hour)
+	info, _ := certificate.Inspect(acme.Paths(storage, "revoked.example.com").Cert, "", time.Now())
+	meta, _ := acme.LoadMeta(storage, "revoked.example.com")
+	meta.RevokedSerial = info.Serial
+	if err := acme.SaveMeta(storage, "revoked.example.com", meta); err != nil {
+		t.Fatal(err)
+	}
+	res, err := Run(context.Background(), Options{
+		Inv: inventory(t, storage, nil), Storage: storage, WindowDays: 30, DryRun: true,
+		Filter: plan.Filter{Exclude: []string{"*.internal.example.com"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]Result{}
+	for _, r := range res {
+		got[r.Name] = r
+	}
+	if r := got["revoked.example.com"]; r.Action != WouldRenew || r.Reason != "certificate was revoked" {
+		t.Errorf("revoked: %+v", r)
+	}
+	if r := got["db.internal.example.com"]; r.Action != Skipped || !strings.Contains(r.Reason, "excluded") {
+		t.Errorf("excluded: %+v", r)
 	}
 }

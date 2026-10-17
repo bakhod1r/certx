@@ -6,7 +6,7 @@ import (
 	"bytes"
 	"fmt"
 	"os"
-	"slices"
+	"path"
 	"sort"
 	"strings"
 
@@ -27,6 +27,44 @@ type Action struct {
 type Options struct {
 	Domains []string // restrict to hosts serving any of these names
 	Force   bool     // also manage hosts whose certificates belong to another client
+	Filter  Filter
+}
+
+// Filter is an allowlist and a denylist of domain patterns ("*.test",
+// "staging.*", "internal.example.com").
+type Filter struct {
+	Allow   []string
+	Exclude []string
+}
+
+// Permits reports whether CertX may manage name.
+func (f Filter) Permits(name string) bool {
+	name = strings.ToLower(name)
+	for _, p := range f.Exclude {
+		if ok, _ := path.Match(strings.ToLower(p), name); ok {
+			return false
+		}
+	}
+	if len(f.Allow) == 0 {
+		return true
+	}
+	for _, p := range f.Allow {
+		if ok, _ := path.Match(strings.ToLower(p), name); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// Names returns the names of h that f permits.
+func (f Filter) Names(names []string) []string {
+	var out []string
+	for _, n := range names {
+		if f.Permits(n) {
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // Actions lists enabled sites with public names and what CertX would do.
@@ -35,7 +73,10 @@ type Options struct {
 func Actions(inv *discovery.Inventory, o Options) []Action {
 	var out []Action
 	for _, h := range Targets(inv, o.Domains) {
-		a := Action{Host: h, Names: discovery.PublicNames(h)}
+		a := Action{Host: h, Names: o.Filter.Names(discovery.PublicNames(h))}
+		if len(a.Names) == 0 {
+			continue // every name is excluded
+		}
 		switch h.Status {
 		case discovery.StatusOK:
 			a.Reason = fmt.Sprintf("certificate valid for %d more days", h.Cert.DaysLeft)
@@ -106,11 +147,25 @@ func matches(names, domains []string) bool {
 		return true
 	}
 	for _, d := range domains {
-		if slices.Contains(names, strings.ToLower(d)) {
-			return true
+		d = strings.ToLower(d)
+		for _, n := range names {
+			if n == d || Covers(d, n) {
+				return true
+			}
 		}
 	}
 	return false
+}
+
+// Covers reports whether the wildcard pattern ("*.example.com") covers the
+// host name ("www.example.com"); a wildcard matches exactly one label.
+func Covers(pattern, name string) bool {
+	suffix, ok := strings.CutPrefix(pattern, "*.")
+	if !ok {
+		return false
+	}
+	label, rest, ok := strings.Cut(name, ".")
+	return ok && label != "" && label != "*" && rest == suffix
 }
 
 // EditFunc edits the content of one virtual host's file.

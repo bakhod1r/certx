@@ -5,6 +5,9 @@ package certificate
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -37,6 +40,8 @@ type Info struct {
 	KeyError          string    `json:"key_error,omitempty"`
 	KeyPermissive     bool      `json:"key_permissive,omitempty"`
 	TLSVersion        string    `json:"tls_version,omitempty"`
+	KeyAlgorithm      string    `json:"key_algorithm"`
+	Weak              []string  `json:"weak,omitempty"` // weak key or signature
 
 	leaf *x509.Certificate
 }
@@ -168,6 +173,7 @@ func describe(certs []*x509.Certificate, dnsName string, now time.Time) *Info {
 		info.DNSNames = append(info.DNSNames, ip.String())
 	}
 	// CheckSignatureFrom would reject self-signed leaves without the CA flag.
+	info.KeyAlgorithm, info.Weak = strength(leaf)
 	info.SelfSigned = bytes.Equal(leaf.RawIssuer, leaf.RawSubject) &&
 		leaf.CheckSignature(leaf.SignatureAlgorithm, leaf.RawTBSCertificate, leaf.Signature) == nil
 
@@ -185,6 +191,31 @@ func describe(certs []*x509.Certificate, dnsName string, now time.Time) *Info {
 		}
 	}
 	return info
+}
+
+// strength describes the public key and flags weak keys or signatures.
+func strength(c *x509.Certificate) (string, []string) {
+	var alg string
+	var weak []string
+	switch k := c.PublicKey.(type) {
+	case *rsa.PublicKey:
+		bits := k.N.BitLen()
+		alg = fmt.Sprintf("RSA %d", bits)
+		if bits < 2048 {
+			weak = append(weak, fmt.Sprintf("RSA key of %d bits (minimum 2048)", bits))
+		}
+	case *ecdsa.PublicKey:
+		alg = "ECDSA " + k.Curve.Params().Name
+	case ed25519.PublicKey:
+		alg = "Ed25519"
+	default:
+		alg = c.PublicKeyAlgorithm.String()
+	}
+	switch c.SignatureAlgorithm {
+	case x509.MD5WithRSA, x509.SHA1WithRSA, x509.ECDSAWithSHA1, x509.DSAWithSHA1:
+		weak = append(weak, "signed with "+c.SignatureAlgorithm.String())
+	}
+	return alg, weak
 }
 
 func name(cn, full string) string {
