@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"os"
@@ -20,6 +21,8 @@ import (
 	"github.com/bakhod1r/certx/internal/certificate"
 	"github.com/bakhod1r/certx/internal/deployment"
 	"github.com/bakhod1r/certx/internal/discovery"
+	"github.com/bakhod1r/certx/internal/issuer"
+	"github.com/bakhod1r/certx/internal/logx"
 	"github.com/bakhod1r/certx/internal/plan"
 	"github.com/bakhod1r/certx/internal/webserver"
 )
@@ -177,46 +180,30 @@ func cmdIssue(g *globals) error {
 	if err != nil {
 		return err
 	}
-	name, err := acme.CertName(g.domains[0])
-	if err != nil {
-		return err
-	}
-	for _, d := range g.domains {
-		if _, err := acme.CertName(d); err != nil || strings.HasPrefix(d, "*.") {
-			return fmt.Errorf("invalid domain %q (wildcards need DNS-01, which is not supported yet)", d)
-		}
-	}
-
 	inv, err := scan(g)
 	if err != nil {
 		return err
 	}
 	preflight(g.domains)
 
-	webroot := g.webroot
-	var challenge *webserver.ChangeSet
-	if webroot == "" {
-		webroot = filepath.Join(g.storage, "acme-challenge")
-		hosts := plan.Serving(inv, g.domains)
-		if len(hosts) == 0 {
-			return fmt.Errorf("no enabled virtual host serves %s; add one or pass --webroot", strings.Join(g.domains, ", "))
-		}
-		challenge, err = plan.Changes(inv, "acme challenge for "+name, hosts, plan.Challenge(webroot))
-		if err != nil {
-			return err
-		}
+	req := issuer.Request{
+		Inv: inv, Storage: g.storage, Directory: dir, Email: g.email, Domains: g.domains,
+		Webroot: g.webroot, Retry: issuer.Retry{Attempts: 2, Delay: 10 * time.Second}, Out: os.Stdout,
 	}
-
+	p, err := issuer.Prepare(req)
+	if err != nil {
+		return err
+	}
 	fmt.Printf("Certificate:  %s\n", strings.Join(g.domains, ", "))
 	fmt.Printf("CA:           %s\n", dir)
-	fmt.Printf("Storage:      %s\n", filepath.Dir(acme.Paths(g.storage, name).Cert))
-	fmt.Printf("Challenge:    HTTP-01 from %s\n", webroot)
+	fmt.Printf("Storage:      %s\n", filepath.Dir(p.Paths.Cert))
+	fmt.Printf("Challenge:    HTTP-01 from %s\n", p.Webroot)
 	if dir == acme.LetsEncryptStaging {
 		fmt.Println("Note:         staging certificates are not trusted by browsers; use --acme production when ready")
 	}
-	if !challenge.Empty() {
+	if !p.Challenge.Empty() {
 		fmt.Println("\nTemporary configuration for the challenge (removed afterwards):")
-		fmt.Println(indent(deployment.Diff(challenge), "  "))
+		fmt.Println(indent(deployment.Diff(p.Challenge), "  "))
 	}
 	if g.dryRun {
 		fmt.Println("Dry run: nothing was changed.")
@@ -225,7 +212,6 @@ func cmdIssue(g *globals) error {
 	if !confirm(g.yes, "Request the certificate?") {
 		return errors.New("aborted")
 	}
-
 	release, err := g.lock()
 	if err != nil {
 		return err
@@ -234,49 +220,19 @@ func cmdIssue(g *globals) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
-	targets := targetsOf(inv)
-	if err := os.MkdirAll(filepath.Join(webroot, ".well-known", "acme-challenge"), 0o755); err != nil {
-		return err
+	ctx, cancel := context.WithTimeout(ctx, g.timeout)
+	defer cancel()
+	acme.SetLogOutput(io.Discard)
+	if f, lerr := logx.Open(g.logFile); g.logFile != "" && lerr == nil {
+		defer f.Close()
+		acme.SetLogOutput(f)
 	}
-	var applied *deployment.Manifest
-	if !challenge.Empty() {
-		step("Adding temporary challenge configuration")
-		if applied, err = deployment.Apply(ctx, challenge, targets, g.backupDir()); err != nil {
-			return err
-		}
-	}
-
-	step("Checking that the challenge is reachable locally")
-	obtainErr := acme.SelfTest(ctx, webroot, g.domains, "127.0.0.1")
-	var bundle *acme.Bundle
-	if obtainErr == nil {
-		step("Requesting certificate")
-		bundle, obtainErr = acme.Obtain(acme.Request{
-			Storage: g.storage, Directory: dir, Email: g.email, Domains: g.domains, Webroot: webroot,
-		})
-	}
-
-	if applied != nil {
-		step("Removing temporary challenge configuration")
-		if _, err := deployment.Rollback(context.Background(), g.backupDir(), applied.ID, targets); err != nil {
-			return errors.Join(obtainErr, fmt.Errorf("removing challenge configuration (backup %s): %w", applied.ID, err))
-		}
-	}
-	if obtainErr != nil {
-		return obtainErr
-	}
-
-	info, err := certificate.InspectPEM(bundle.FullChain, time.Now())
+	info, err := issuer.Execute(ctx, req, p)
+	audit(g, "issue", g.domains, err, "")
 	if err != nil {
 		return err
 	}
-	paths, err := acme.Save(g.storage, name, bundle, acme.Meta{
-		Domains: g.domains, Directory: dir, Serial: info.Serial, IssuedAt: time.Now().UTC(), NotAfter: info.NotAfter,
-	})
-	if err != nil {
-		return err
-	}
-	fmt.Printf("✔ Certificate saved to %s (expires %s)\n", paths.Cert, info.NotAfter.Format(time.DateOnly))
+	fmt.Printf("✔ Certificate saved to %s (expires %s)\n", p.Paths.Cert, info.NotAfter.Format(time.DateOnly))
 
 	if !g.deploy {
 		fmt.Printf("Next: certx deploy --domain %s\n", g.domains[0])
@@ -370,7 +326,12 @@ func cmdDeploy(g *globals) error {
 	defer release()
 
 	step("Backing up, testing configuration and reloading")
-	m, err := deployment.Apply(context.Background(), cs, targetsOf(inv), g.backupDir())
+	m, err := deployment.Apply(context.Background(), cs, issuer.Targets(inv), g.backupDir())
+	backupID := ""
+	if m != nil {
+		backupID = m.ID
+	}
+	audit(g, "deploy", g.domains, err, backupID)
 	if err != nil {
 		return err
 	}
@@ -462,7 +423,9 @@ func cmdRollback(g *globals, args []string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := deployment.Rollback(context.Background(), g.backupDir(), id, targetsOf(inv)); err != nil {
+	_, err = deployment.Rollback(context.Background(), g.backupDir(), id, issuer.Targets(inv))
+	audit(g, "rollback", nil, err, id)
+	if err != nil {
 		return err
 	}
 	fmt.Println("✔ Rolled back", id)
@@ -471,14 +434,15 @@ func cmdRollback(g *globals, args []string) error {
 
 // ---------------------------------------------------------------- helpers
 
-func targetsOf(inv *discovery.Inventory) map[webserver.Kind]deployment.Target {
-	t := map[webserver.Kind]deployment.Target{}
-	for _, s := range inv.Servers {
-		if a := inv.Adapter(s.Kind); a != nil && s.Found {
-			t[s.Kind] = deployment.Target{Adapter: a, Inst: s}
-		}
+// audit records an action in the audit trail; failures only warn.
+func audit(g *globals, action string, domains []string, err error, backup string) {
+	e := logx.Event{Action: action, Domains: domains, Result: "ok", Backup: backup}
+	if err != nil {
+		e.Result, e.Detail = "failed", err.Error()
 	}
-	return t
+	if aerr := logx.Audit(g.storage, e); aerr != nil {
+		fmt.Fprintln(os.Stderr, "warning: audit log:", aerr)
+	}
 }
 
 func confirm(yes bool, prompt string) bool {

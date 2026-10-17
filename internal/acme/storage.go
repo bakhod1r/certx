@@ -22,6 +22,7 @@ var nameRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9.-]*[a-z0-9])?$`)
 type Meta struct {
 	Domains   []string  `json:"domains"`
 	Directory string    `json:"directory"`
+	Email     string    `json:"email,omitempty"`
 	Serial    string    `json:"serial"`
 	IssuedAt  time.Time `json:"issued_at"`
 	NotAfter  time.Time `json:"not_after"`
@@ -70,6 +71,19 @@ func Save(storage, name string, b *Bundle, meta Meta) (webserver.CertPaths, erro
 		return paths, err
 	}
 	return paths, deployment.AtomicWrite(filepath.Join(dir, "meta.json"), append(data, '\n'), 0o644)
+}
+
+// List returns the names of all stored certificates.
+func List(storage string) ([]string, error) {
+	matches, err := filepath.Glob(filepath.Join(storage, "certs", "*", "meta.json"))
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, m := range matches {
+		names = append(names, filepath.Base(filepath.Dir(m)))
+	}
+	return names, nil
 }
 
 // LoadMeta reads the metadata of a stored certificate.

@@ -10,8 +10,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/bakhod1r/certx/internal/acme"
+	"github.com/bakhod1r/certx/internal/config"
 	"github.com/bakhod1r/certx/internal/discovery"
 	"github.com/bakhod1r/certx/internal/lockfile"
 	"github.com/bakhod1r/certx/internal/tui"
@@ -35,6 +37,9 @@ Commands:
   issue      Obtain a certificate over ACME HTTP-01 (staging by default)
   deploy     Point virtual hosts at a CertX certificate (backup, test, reload)
   rollback   List backups or restore one
+  renew      Renew CertX certificates inside the renewal window (for timers)
+  scheduler  install | status | uninstall the twice-daily renewal job
+  notify     Send a test notification to the configured channels
   validate   Run nginx -t / apachectl -t
   version    Print version
 
@@ -44,6 +49,11 @@ Examples:
   certx issue  --domain example.com --acme production --deploy --redirect
   certx deploy --domain example.com --dry-run
   certx rollback --list
+  certx renew --dry-run
+  certx scheduler install
+
+Settings and secrets (CERTX_WEBHOOK_URL, CERTX_TELEGRAM_TOKEN, CERTX_TELEGRAM_CHAT_ID,
+CERTX_SMTP_ADDR, CERTX_EMAIL_TO, ...) can live in /etc/certx/env (KEY=VALUE, chmod 600).
 
 Flags:
 `
@@ -75,6 +85,14 @@ type globals struct {
 	deploy   bool
 	list     bool
 
+	windowDays int
+	alertDays  int
+	timeout    time.Duration
+	quiet      bool
+	logFile    string
+	scheduler  string
+	setFlags   []string // flags given explicitly, forwarded to the scheduled job
+
 	locked bool // the run lock is already held by this process
 }
 
@@ -101,6 +119,8 @@ func main() {
 	case errors.Is(err, flag.ErrHelp):
 	case errors.Is(err, errCritical):
 		os.Exit(2)
+	case errors.Is(err, errRenewFailed):
+		os.Exit(1)
 	default:
 		fmt.Fprintln(os.Stderr, "certx:", err)
 		os.Exit(1)
@@ -108,6 +128,13 @@ func main() {
 }
 
 func run(args []string) error {
+	envFile := envOr("CERTX_ENV_FILE", config.DefaultEnvFile)
+	if warn, err := config.LoadEnvFile(envFile); err != nil {
+		return err
+	} else if warn != "" {
+		fmt.Fprintln(os.Stderr, "warning:", warn)
+	}
+
 	cmd := "tui"
 	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
 		cmd, args = args[0], args[1:]
@@ -136,9 +163,23 @@ func run(args []string) error {
 	fs.BoolVar(&g.redirect, "redirect", false, "add an HTTP to HTTPS redirect when deploying")
 	fs.BoolVar(&g.deploy, "deploy", false, "deploy the certificate after issuing it")
 	fs.BoolVar(&g.list, "list", false, "list backups (rollback)")
-	if err := fs.Parse(args); err != nil {
+	fs.IntVar(&g.windowDays, "window-days", envInt("CERTX_RENEW_DAYS", 30), "renew certificates expiring within this many days")
+	fs.IntVar(&g.alertDays, "alert-days", envInt("CERTX_ALERT_DAYS", 14), "notify about certificates expiring within this many days")
+	fs.DurationVar(&g.timeout, "timeout", 30*time.Minute, "overall time limit for issue and renew")
+	fs.BoolVar(&g.quiet, "quiet", false, "only print renewals, failures and alerts (renew)")
+	fs.StringVar(&g.logFile, "log-file", envOr("CERTX_LOG_FILE", "/var/log/certx/certx.log"), "renew log file (rotated); empty disables")
+	fs.StringVar(&g.scheduler, "scheduler", "auto", "scheduler backend: auto, systemd or cron")
+	positional, err := parseInterspersed(fs, args)
+	if err != nil {
 		return err
 	}
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "server", "nginx-conf", "apache-conf", "apache-root", "storage", "acme", "email",
+			"window-days", "alert-days", "warn-days", "log-file", "timeout":
+			g.setFlags = append(g.setFlags, "--"+f.Name+"="+f.Value.String())
+		}
+	})
 	switch *server {
 	case "auto", "":
 	case "nginx", "apache":
@@ -159,7 +200,13 @@ func run(args []string) error {
 	case "deploy":
 		return cmdDeploy(&g)
 	case "rollback":
-		return cmdRollback(&g, fs.Args())
+		return cmdRollback(&g, positional)
+	case "renew":
+		return cmdRenew(&g)
+	case "scheduler":
+		return cmdScheduler(&g, positional)
+	case "notify":
+		return cmdNotify(&g)
 	case "validate":
 		return cmdValidate(&g)
 	case "version":
@@ -171,6 +218,26 @@ func run(args []string) error {
 	default:
 		fs.Usage()
 		return fmt.Errorf("unknown command %q", cmd)
+	}
+}
+
+// parseInterspersed parses flags that appear before, between or after
+// positional arguments ("scheduler install --yes", "rollback ID --yes").
+func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
+	var positional []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			return nil, err
+		}
+		rest := fs.Args()
+		if len(rest) == 0 {
+			return positional, nil
+		}
+		if rest[0] == "--" {
+			return append(positional, rest[1:]...), nil
+		}
+		positional = append(positional, rest[0])
+		args = rest[1:]
 	}
 }
 

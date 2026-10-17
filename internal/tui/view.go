@@ -117,6 +117,14 @@ func (m model) summary() string {
 	if n := len(m.inv.Warnings); n > 0 {
 		parts = append(parts, warnStyle.Render(fmt.Sprintf("%d warnings (w)", n)))
 	}
+	switch r := m.lastRun; {
+	case r == nil:
+		parts = append(parts, mutedStyle.Render("renew: never run"))
+	case r.OK():
+		parts = append(parts, mutedStyle.Render("renew: ")+okStyle.Render("✔ "+ago(r.Finished)))
+	default:
+		parts = append(parts, mutedStyle.Render("renew: ")+errStyle.Render(fmt.Sprintf("✖ %d failed %s", r.Failed, ago(r.Finished))))
+	}
 	return strings.Join(parts, mutedStyle.Render(" · "))
 }
 
@@ -313,6 +321,19 @@ func certBlock(c *certificate.Info) string {
 	}
 	b.WriteString(kv("Chain", chain))
 	return b.String()
+}
+
+func ago(t time.Time) string {
+	d := time.Since(t)
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 48*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	}
+	return fmt.Sprintf("%dd ago", int(d.Hours()/24))
 }
 
 func orDash(s string) string {

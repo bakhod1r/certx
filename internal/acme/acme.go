@@ -13,7 +13,9 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
+	stdlog "log"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -23,6 +25,7 @@ import (
 	"github.com/go-acme/lego/v4/certcrypto"
 	"github.com/go-acme/lego/v4/certificate"
 	"github.com/go-acme/lego/v4/lego"
+	legolog "github.com/go-acme/lego/v4/log"
 	"github.com/go-acme/lego/v4/providers/http/webroot"
 	"github.com/go-acme/lego/v4/registration"
 
@@ -33,6 +36,11 @@ const (
 	LetsEncryptStaging    = "https://acme-staging-v02.api.letsencrypt.org/directory"
 	LetsEncryptProduction = "https://acme-v02.api.letsencrypt.org/directory"
 )
+
+// SetLogOutput redirects lego's progress log (stderr by default).
+func SetLogOutput(w io.Writer) {
+	legolog.Logger = stdlog.New(w, "lego: ", stdlog.LstdFlags)
+}
 
 // DirectoryURL resolves "staging", "production" or a custom URL.
 func DirectoryURL(s string) (string, error) {
@@ -72,6 +80,40 @@ func Obtain(req Request) (*Bundle, error) {
 	if err != nil {
 		return nil, fmt.Errorf("account: %w", err)
 	}
+	client, err := newClient(user, req)
+	if err != nil {
+		return nil, err
+	}
+	if user.Registration == nil {
+		if err := register(client, user); err != nil {
+			return nil, err
+		}
+	}
+	res, err := client.Certificate.Obtain(certificate.ObtainRequest{Domains: req.Domains, Bundle: true})
+	if err != nil && strings.Contains(err.Error(), "accountDoesNotExist") {
+		// The CA no longer knows the stored account (deactivated, or the
+		// storage was moved between CAs). The client signs with the old
+		// account URL, so build a fresh one, register again and retry once.
+		user.Registration = nil
+		if client, err = newClient(user, req); err != nil {
+			return nil, err
+		}
+		if err := register(client, user); err != nil {
+			return nil, err
+		}
+		res, err = client.Certificate.Obtain(certificate.ObtainRequest{Domains: req.Domains, Bundle: true})
+	}
+	if err != nil {
+		return nil, explain(err)
+	}
+	leaf, chain := splitBundle(res.Certificate)
+	if len(chain) == 0 {
+		chain = res.IssuerCertificate
+	}
+	return &Bundle{Leaf: leaf, Chain: chain, FullChain: res.Certificate, PrivateKey: res.PrivateKey}, nil
+}
+
+func newClient(user *account, req Request) (*lego.Client, error) {
 	cfg := lego.NewConfig(user)
 	cfg.CADirURL = req.Directory
 	cfg.Certificate.KeyType = certcrypto.EC256
@@ -87,25 +129,16 @@ func Obtain(req Request) (*Bundle, error) {
 	if err := client.Challenge.SetHTTP01Provider(provider); err != nil {
 		return nil, err
 	}
-	if user.Registration == nil {
-		reg, err := client.Registration.Register(registration.RegisterOptions{TermsOfServiceAgreed: true})
-		if err != nil {
-			return nil, explain(fmt.Errorf("register account: %w", err))
-		}
-		user.Registration = reg
-		if err := user.save(); err != nil {
-			return nil, err
-		}
-	}
-	res, err := client.Certificate.Obtain(certificate.ObtainRequest{Domains: req.Domains, Bundle: true})
+	return client, nil
+}
+
+func register(client *lego.Client, user *account) error {
+	reg, err := client.Registration.Register(registration.RegisterOptions{TermsOfServiceAgreed: true})
 	if err != nil {
-		return nil, explain(err)
+		return explain(fmt.Errorf("register account: %w", err))
 	}
-	leaf, chain := splitBundle(res.Certificate)
-	if len(chain) == 0 {
-		chain = res.IssuerCertificate
-	}
-	return &Bundle{Leaf: leaf, Chain: chain, FullChain: res.Certificate, PrivateKey: res.PrivateKey}, nil
+	user.Registration = reg
+	return user.save()
 }
 
 func splitBundle(full []byte) (leaf, chain []byte) {

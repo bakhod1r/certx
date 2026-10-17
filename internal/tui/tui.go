@@ -21,6 +21,7 @@ import (
 	"github.com/bakhod1r/certx/internal/deployment"
 	"github.com/bakhod1r/certx/internal/discovery"
 	"github.com/bakhod1r/certx/internal/plan"
+	"github.com/bakhod1r/certx/internal/state"
 	"github.com/bakhod1r/certx/internal/webserver"
 )
 
@@ -51,8 +52,9 @@ var (
 
 type (
 	scanDoneMsg struct {
-		inv *discovery.Inventory
-		err error
+		inv     *discovery.Inventory
+		lastRun *state.Run
+		err     error
 	}
 	validateDoneMsg struct{ out string }
 	exportDoneMsg   struct {
@@ -98,6 +100,7 @@ type model struct {
 
 	width, height int
 	help          bool
+	lastRun       *state.Run
 }
 
 func newModel(opts Options) model {
@@ -121,15 +124,16 @@ func newModel(opts Options) model {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(m.spin.Tick, scanCmd(m.opts.Scan))
+	return tea.Batch(m.spin.Tick, scanCmd(m.opts))
 }
 
-func scanCmd(opts discovery.Options) tea.Cmd {
+func scanCmd(opts Options) tea.Cmd {
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 		defer cancel()
-		inv, err := discovery.Scan(ctx, opts)
-		return scanDoneMsg{inv: inv, err: err}
+		inv, err := discovery.Scan(ctx, opts.Scan)
+		last, _ := state.LastRun(opts.Storage)
+		return scanDoneMsg{inv: inv, lastRun: last, err: err}
 	}
 }
 
@@ -191,6 +195,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.inv = msg.inv
+		m.lastRun = msg.lastRun
 		m.remote = map[int]remoteResult{}
 		m.applyFilter()
 		m.flash = fmt.Sprintf("Scanned %d virtual hosts", len(m.inv.Hosts))
@@ -295,7 +300,7 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "r":
 		if m.busy == "" {
 			m.busy = "Rescanning…"
-			return m, tea.Batch(m.spin.Tick, scanCmd(m.opts.Scan))
+			return m, tea.Batch(m.spin.Tick, scanCmd(m.opts))
 		}
 	case "v":
 		if m.busy == "" && m.inv != nil {

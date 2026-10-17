@@ -78,6 +78,16 @@ certx plan --server nginx
 certx issue --server nginx --domain app.certx.test --domain www.app.certx.test \
   --acme "$ACME" --deploy --redirect --yes
 check_https app.certx.test
+serial() { echo | openssl s_client -connect 127.0.0.1:443 -servername "$1" 2>/dev/null | openssl x509 -noout -serial; }
+BEFORE=$(serial app.certx.test)
+certx renew --server nginx --domain app.certx.test --acme "$ACME" --dry-run
+certx renew --server nginx --domain app.certx.test --acme "$ACME" --force
+AFTER=$(serial app.certx.test)
+[ "$BEFORE" != "$AFTER" ] || { echo "renew did not change the served certificate"; exit 1; }
+certx renew --server nginx --domain app.certx.test --acme "$ACME" | grep -q "valid for" # idempotent: skipped now
+certx scheduler install --scheduler cron --yes
+certx scheduler status
+certx scheduler uninstall --yes
 ID=$(certx rollback --list | awk '/deploy app/ && /applied/ {print $1; exit}')
 certx rollback --server nginx --yes "$ID"
 nginx -s stop

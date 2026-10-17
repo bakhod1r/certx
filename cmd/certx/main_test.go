@@ -1,6 +1,9 @@
 package main
 
 import (
+	"flag"
+	"io"
+	"reflect"
 	"testing"
 )
 
@@ -24,4 +27,18 @@ func TestLockReentrantAndReleasable(t *testing.T) {
 		t.Fatalf("lock not released: %v", err)
 	}
 	again()
+}
+
+func TestParseInterspersed(t *testing.T) {
+	fs := flag.NewFlagSet("t", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	yes := fs.Bool("yes", false, "")
+	server := fs.String("server", "", "")
+	pos, err := parseInterspersed(fs, []string{"install", "--server", "nginx", "extra", "--yes", "--", "--literal"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !*yes || *server != "nginx" || !reflect.DeepEqual(pos, []string{"install", "extra", "--literal"}) {
+		t.Errorf("yes=%v server=%q pos=%v", *yes, *server, pos)
+	}
 }

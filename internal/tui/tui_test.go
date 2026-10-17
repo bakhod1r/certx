@@ -5,10 +5,12 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/bakhod1r/certx/internal/discovery"
+	"github.com/bakhod1r/certx/internal/state"
 	"github.com/bakhod1r/certx/internal/webserver"
 )
 
@@ -48,10 +50,10 @@ func TestModelFlow(t *testing.T) {
 	if !strings.Contains(m.View(), "Scanning") {
 		t.Fatal("expected loading screen")
 	}
-	m, _ = m.Update(scanDoneMsg{inv: inv})
+	m, _ = m.Update(scanDoneMsg{inv: inv, lastRun: &state.Run{Finished: time.Now().Add(-3 * time.Hour), Failed: 1}})
 
 	out := m.View()
-	for _, s := range []string{"CertX", "8 hosts", "app.example.com", "blog.example.org", "[disabled]"} {
+	for _, s := range []string{"CertX", "8 hosts", "✖ 1 failed 3h ago", "app.example.com", "blog.example.org", "[disabled]"} {
 		if !strings.Contains(out, s) {
 			t.Errorf("list view missing %q", s)
 		}

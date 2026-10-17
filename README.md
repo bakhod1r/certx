@@ -24,6 +24,16 @@ Implemented (P0):
   backup → `nginx -t` / `apachectl -t` → graceful reload → HTTPS verification;
   any failure restores the backup automatically.
 - **Rollback** — every change is recorded and can be undone.
+- **Renew** — renews CertX certificates inside the renewal window, reuses the
+  issuing CA and account, retries transient failures with backoff, reloads the
+  servers using the certificate and verifies what HTTPS serves. Idempotent and
+  locked against concurrent runs.
+- **Scheduler** — twice-daily systemd timer (randomised, persistent) or cron job.
+- **Alerts** — webhook (Slack/Mattermost compatible), Telegram and email for
+  failed renewals and for any certificate on the server expiring soon
+  (including Certbot or manually managed ones).
+- **Logs** — rotated log file, JSON audit trail of issue/renew/deploy/rollback,
+  last-run state shown by `certx scheduler status` and the TUI.
 - **TUI** and scriptable commands with JSON output and CI exit codes.
 
 ## Install
@@ -45,7 +55,57 @@ sudo certx deploy --domain example.com --dry-run
 sudo certx rollback --list
 sudo certx rollback <id>
 sudo certx validate                           # nginx -t / apachectl -t
+sudo certx renew --dry-run                    # what would be renewed
+sudo certx scheduler install                  # systemd timer (or cron) running `certx renew`
+sudo certx scheduler status                   # next run, last run, Certbot timers
+sudo certx notify                             # send a test alert
 ```
+
+### Automatic renewal
+
+```sh
+sudo certx scheduler install            # auto-detects systemd, falls back to cron
+sudo certx scheduler install --scheduler cron --window-days 21
+```
+
+The job runs `certx renew --yes` twice a day with any explicitly given flags
+(`--server`, `--nginx-conf`, `--storage`, `--window-days`, …). A certificate
+is renewed when it expires within `--window-days` (30); the run exits non-zero
+when a renewal fails, so systemd marks the unit failed.
+
+### Settings, secrets and alerts
+
+Put secrets in `/etc/certx/env` (`KEY=VALUE`, `chmod 600`); it is read by
+interactive runs, cron and systemd alike, and real environment variables win:
+
+```sh
+CERTX_EMAIL=ops@example.com
+CERTX_ACME=production
+CERTX_WEBHOOK_URL=https://hooks.slack.com/services/...
+CERTX_TELEGRAM_TOKEN=123456:ABC...
+CERTX_TELEGRAM_CHAT_ID=-100123456
+CERTX_SMTP_ADDR=smtp.example.com:587
+CERTX_SMTP_USER=certx@example.com
+CERTX_SMTP_PASSWORD=...
+CERTX_EMAIL_FROM=certx@example.com
+CERTX_EMAIL_TO=ops@example.com,oncall@example.com
+CERTX_ALERT_DAYS=14
+```
+
+`renew` notifies only when something happened: a renewal, a failure, or a
+certificate expiring within `--alert-days`. Tokens and passwords never appear
+in output or logs.
+
+### Files
+
+| Path | Content |
+|---|---|
+| `/var/lib/certx/certs/<name>/` | `fullchain.pem`, `privkey.pem` (0600), `cert.pem`, `chain.pem`, `meta.json` |
+| `/var/lib/certx/accounts/` | ACME account keys (0600) |
+| `/var/lib/certx/backups/` | configuration backups and manifests for `rollback` |
+| `/var/lib/certx/audit.log` | JSON audit trail |
+| `/var/lib/certx/state.json` | last renewal run |
+| `/var/log/certx/certx.log` | renewal log including ACME protocol details (rotated, 5 × 10 MiB) |
 
 `issue`, `deploy` and `rollback` show a diff and ask for confirmation; use
 `--yes` for automation and `--dry-run` to only preview.
@@ -112,13 +172,20 @@ Certbot-managed and skipped unless `--force` is given.
 | `--acme` | `CERTX_ACME` | `staging` (`production` or an https directory URL) |
 | `--domain` | | repeatable or comma-separated |
 | `--webroot` | | use an existing webroot instead of the temporary snippet |
-| `--deploy`, `--redirect`, `--force`, `--dry-run`, `--yes`, `--json` | | `false` |
+| `--window-days` | `CERTX_RENEW_DAYS` | `30` |
+| `--alert-days` | `CERTX_ALERT_DAYS` | `14` |
+| `--log-file` | `CERTX_LOG_FILE` | `/var/log/certx/certx.log` |
+| `--timeout` | | `30m` |
+| `--scheduler` | | `auto` (`systemd` or `cron`) |
+| `--deploy`, `--redirect`, `--force`, `--dry-run`, `--yes`, `--json`, `--quiet` | | `false` |
+| | `CERTX_ENV_FILE` | `/etc/certx/env` |
 
 ### Statuses
 
 `OK`, `NO TLS`, `SELF-SIGNED`, `EXPIRING`, `BAD CHAIN`, `MISMATCH`,
 `NOT YET VALID`, `KEY MISMATCH`, `EXPIRED`, `ERROR` (ordered by severity).
-`scan` exits with code `2` when an enabled host is `MISMATCH` or worse.
+`scan` exits with code `2` when an enabled host is `MISMATCH` or worse;
+`renew` exits with `1` when any renewal failed.
 
 ## Development
 
